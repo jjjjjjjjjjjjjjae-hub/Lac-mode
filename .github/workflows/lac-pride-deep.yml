@@ -1,0 +1,665 @@
+name: LAC Pride Deep Scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download XAPK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input
+          gh release download v1.0-base --pattern '*.xapk' --dir input
+
+      - name: Extract game data
+        run: |
+          mkdir -p work/xapk work/obb
+
+          XAPK=$(find input -name "*.xapk" | head -n 1)
+          echo "XAPK=$XAPK"
+          unzip -q "$XAPK" -d work/xapk
+
+          OBB=$(find work/xapk -name "*.obb" | head -n 1)
+          echo "OBB=$OBB"
+
+          if [ -z "$OBB" ]; then
+            echo "OBB NOT FOUND"
+            exit 1
+          fi
+
+          unzip -q "$OBB" -d work/obb
+
+      - name: Install UnityPy
+        run: |
+          python -m pip install --upgrade pip
+          pip install UnityPy
+
+      - name: Deep scan Vehicle Pride
+        run: |
+          python - <<'PY'
+          import os
+          from collections import defaultdict
+          import UnityPy
+
+          TARGET = "work/obb/assets/bin/Data/data.unity3d"
+
+          if not os.path.exists(TARGET):
+              raise SystemExit("data.unity3d NOT FOUND")
+
+          env = UnityPy.load(TARGET)
+          objects = list(env.objects)
+
+          cache = {}
+
+          def key(obj):
+              try:
+                  af = getattr(obj, "assets_file", None)
+                  name = getattr(af, "name", "") or ""
+              except Exception:
+                  name = ""
+              return (name, obj.path_id)
+
+          def read_obj(obj):
+              k = key(obj)
+              if k in cache:
+                  return cache[k]
+
+              try:
+                  data = obj.read()
+              except Exception:
+                  data = None
+
+              cache[k] = data
+              return data
+
+          def ptr_reader(ptr):
+              if ptr is None:
+                  return None
+
+              try:
+                  return ptr.get_obj()
+              except Exception:
+                  return None
+
+          def ptr_name(ptr):
+              obj = ptr_reader(ptr)
+
+              if obj is None:
+                  return ""
+
+              data = read_obj(obj)
+
+              if data is None:
+                  return ""
+
+              return getattr(data, "m_Name", "") or ""
+
+          def vec(v):
+              if v is None:
+                  return ""
+
+              vals = []
+
+              for attr in ("x", "y", "z", "w"):
+                  if hasattr(v, attr):
+                      vals.append(
+                          f"{attr}={getattr(v, attr)}"
+                      )
+
+              return ", ".join(vals)
+
+          gameobjects = {}
+          transforms = {}
+
+          go_transform = {}
+          transform_go = {}
+
+          components = defaultdict(list)
+
+          for obj in objects:
+
+              typ = obj.type.name
+
+              if typ == "GameObject":
+                  data = read_obj(obj)
+
+                  if data is None:
+                      continue
+
+                  gokey = key(obj)
+                  name = getattr(data, "m_Name", "") or ""
+
+                  gameobjects[gokey] = {
+                      "reader": obj,
+                      "data": data,
+                      "name": name
+                  }
+
+                  raw_components = (
+                      getattr(data, "m_Component", None)
+                      or getattr(data, "m_Components", None)
+                      or []
+                  )
+
+                  for entry in raw_components:
+
+                      ptr = getattr(entry, "component", None)
+
+                      if ptr is None:
+                          ptr = getattr(entry, "m_Component", None)
+
+                      if ptr is None:
+                          ptr = entry
+
+                      comp_reader = ptr_reader(ptr)
+
+                      if comp_reader is not None:
+                          components[gokey].append(comp_reader)
+
+              elif typ in ("Transform", "RectTransform"):
+
+                  data = read_obj(obj)
+
+                  if data is None:
+                      continue
+
+                  try:
+                      go_reader = ptr_reader(data.m_GameObject)
+                  except Exception:
+                      go_reader = None
+
+                  if go_reader is None:
+                      continue
+
+                  gokey = key(go_reader)
+                  tkey = key(obj)
+
+                  transforms[tkey] = {
+                      "reader": obj,
+                      "data": data
+                  }
+
+                  go_transform[gokey] = tkey
+                  transform_go[tkey] = gokey
+
+          parent = {}
+          children = defaultdict(list)
+
+          for gokey, tkey in go_transform.items():
+
+              tdata = transforms[tkey]["data"]
+
+              try:
+                  father_reader = ptr_reader(tdata.m_Father)
+              except Exception:
+                  father_reader = None
+
+              if father_reader is None:
+                  continue
+
+              father_tkey = key(father_reader)
+
+              parent_go = transform_go.get(father_tkey)
+
+              if parent_go is not None:
+                  parent[gokey] = parent_go
+                  children[parent_go].append(gokey)
+
+          def go_name(gokey):
+              item = gameobjects.get(gokey)
+              if item is None:
+                  return ""
+              return item["name"]
+
+          def full_path(gokey):
+
+              result = []
+              seen = set()
+              cur = gokey
+
+              while cur is not None and cur not in seen:
+
+                  seen.add(cur)
+
+                  name = go_name(cur)
+
+                  if name:
+                      result.append(name)
+
+                  cur = parent.get(cur)
+
+              return "/".join(reversed(result))
+
+          pride_roots = []
+
+          for gokey, item in gameobjects.items():
+              name = item["name"]
+
+              if name.lower().startswith("vehicle_pride"):
+                  pride_roots.append(gokey)
+
+          pride_roots.sort(
+              key=lambda x: full_path(x).lower()
+          )
+
+          if not pride_roots:
+              raise SystemExit("Vehicle_Pride NOT FOUND")
+
+          descendants = set()
+
+          def collect(gokey):
+              if gokey in descendants:
+                  return
+
+              descendants.add(gokey)
+
+              for child in children.get(gokey, []):
+                  collect(child)
+
+          for root in pride_roots:
+              collect(root)
+
+          def script_info(comp_reader):
+
+              try:
+                  data = read_obj(comp_reader)
+              except Exception:
+                  return ""
+
+              if data is None:
+                  return ""
+
+              try:
+                  script_obj = ptr_reader(data.m_Script)
+              except Exception:
+                  script_obj = None
+
+              if script_obj is None:
+                  return ""
+
+              script = read_obj(script_obj)
+
+              if script is None:
+                  return ""
+
+              cls = getattr(script, "m_ClassName", "") or ""
+              ns = getattr(script, "m_Namespace", "") or ""
+              assembly = getattr(script, "m_AssemblyName", "") or ""
+              name = getattr(script, "m_Name", "") or ""
+
+              return (
+                  f"name={name}; "
+                  f"class={cls}; "
+                  f"namespace={ns}; "
+                  f"assembly={assembly}"
+              )
+
+          def component_details(comp_reader):
+
+              typ = comp_reader.type.name
+              data = read_obj(comp_reader)
+
+              if data is None:
+                  return "READ_ERROR"
+
+              parts = []
+
+              if typ == "MonoBehaviour":
+                  info = script_info(comp_reader)
+                  if info:
+                      parts.append(info)
+
+              elif typ == "Rigidbody":
+
+                  for field in (
+                      "m_Mass",
+                      "m_Drag",
+                      "m_AngularDrag",
+                      "m_UseGravity",
+                      "m_IsKinematic"
+                  ):
+                      if hasattr(data, field):
+                          parts.append(
+                              f"{field}={getattr(data, field)}"
+                          )
+
+              elif typ == "WheelCollider":
+
+                  for field in (
+                      "m_Mass",
+                      "m_Radius",
+                      "m_WheelDampingRate",
+                      "m_SuspensionDistance",
+                      "m_ForceAppPointDistance"
+                  ):
+                      if hasattr(data, field):
+                          parts.append(
+                              f"{field}={getattr(data, field)}"
+                          )
+
+                  if hasattr(data, "m_Center"):
+                      parts.append(
+                          "center=(" + vec(data.m_Center) + ")"
+                      )
+
+              elif typ in (
+                  "BoxCollider",
+                  "SphereCollider",
+                  "CapsuleCollider"
+              ):
+
+                  if hasattr(data, "m_IsTrigger"):
+                      parts.append(
+                          f"trigger={data.m_IsTrigger}"
+                      )
+
+                  if hasattr(data, "m_Center"):
+                      parts.append(
+                          "center=(" + vec(data.m_Center) + ")"
+                      )
+
+                  if hasattr(data, "m_Size"):
+                      parts.append(
+                          "size=(" + vec(data.m_Size) + ")"
+                      )
+
+                  if hasattr(data, "m_Radius"):
+                      parts.append(
+                          f"radius={data.m_Radius}"
+                      )
+
+                  if hasattr(data, "m_Height"):
+                      parts.append(
+                          f"height={data.m_Height}"
+                      )
+
+              elif typ == "MeshCollider":
+
+                  if hasattr(data, "m_IsTrigger"):
+                      parts.append(
+                          f"trigger={data.m_IsTrigger}"
+                      )
+
+                  try:
+                      parts.append(
+                          f"mesh={ptr_name(data.m_Mesh)}"
+                      )
+                  except Exception:
+                      pass
+
+              elif typ == "MeshFilter":
+
+                  try:
+                      parts.append(
+                          f"mesh={ptr_name(data.m_Mesh)}"
+                      )
+                  except Exception:
+                      pass
+
+              elif typ in (
+                  "MeshRenderer",
+                  "SkinnedMeshRenderer"
+              ):
+
+                  try:
+                      mats = []
+
+                      for ptr in data.m_Materials:
+                          name = ptr_name(ptr)
+
+                          if name:
+                              mats.append(name)
+
+                      parts.append(
+                          "materials=" + ",".join(mats)
+                      )
+                  except Exception:
+                      pass
+
+                  if typ == "SkinnedMeshRenderer":
+                      try:
+                          parts.append(
+                              f"mesh={ptr_name(data.m_Mesh)}"
+                          )
+                      except Exception:
+                          pass
+
+              elif typ in ("Transform", "RectTransform"):
+
+                  if hasattr(data, "m_LocalPosition"):
+                      parts.append(
+                          "position=("
+                          + vec(data.m_LocalPosition)
+                          + ")"
+                      )
+
+                  if hasattr(data, "m_LocalRotation"):
+                      parts.append(
+                          "rotation=("
+                          + vec(data.m_LocalRotation)
+                          + ")"
+                      )
+
+                  if hasattr(data, "m_LocalScale"):
+                      parts.append(
+                          "scale=("
+                          + vec(data.m_LocalScale)
+                          + ")"
+                      )
+
+              elif typ == "AudioSource":
+
+                  try:
+                      parts.append(
+                          f"clip={ptr_name(data.m_audioClip)}"
+                      )
+                  except Exception:
+                      pass
+
+                  for field in (
+                      "m_Volume",
+                      "m_Pitch",
+                      "Loop"
+                  ):
+                      if hasattr(data, field):
+                          parts.append(
+                              f"{field}={getattr(data, field)}"
+                          )
+
+              return "; ".join(parts)
+
+          with open(
+              "work/pride-hierarchy.txt",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              def dump(gokey, depth=0):
+
+                  indent = "  " * depth
+
+                  out.write(
+                      f"{indent}- {go_name(gokey)}\n"
+                  )
+
+                  for comp in components.get(gokey, []):
+
+                      details = component_details(comp)
+
+                      out.write(
+                          f"{indent}    "
+                          f"[{comp.type.name}] "
+                          f"PathID={comp.path_id}"
+                      )
+
+                      if details:
+                          out.write(
+                              f" :: {details}"
+                          )
+
+                      out.write("\n")
+
+                  child_list = sorted(
+                      children.get(gokey, []),
+                      key=lambda x: go_name(x).lower()
+                  )
+
+                  for child in child_list:
+                      dump(child, depth + 1)
+
+              for root in pride_roots:
+
+                  out.write(
+                      "=" * 100 + "\n"
+                  )
+
+                  out.write(
+                      f"ROOT: {full_path(root)}\n"
+                  )
+
+                  out.write(
+                      "=" * 100 + "\n\n"
+                  )
+
+                  dump(root)
+
+                  out.write("\n\n")
+
+          with open(
+              "work/pride-components.tsv",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              out.write(
+                  "GameObject\tPath\t"
+                  "Component\tPathID\tDetails\n"
+              )
+
+              for gokey in sorted(
+                  descendants,
+                  key=lambda x: full_path(x).lower()
+              ):
+
+                  for comp in components.get(gokey, []):
+
+                      details = component_details(comp)
+
+                      details = details.replace(
+                          "\t", " "
+                      ).replace(
+                          "\n", " "
+                      )
+
+                      out.write(
+                          f"{go_name(gokey)}\t"
+                          f"{full_path(gokey)}\t"
+                          f"{comp.type.name}\t"
+                          f"{comp.path_id}\t"
+                          f"{details}\n"
+                      )
+
+          with open(
+              "work/pride-scripts.txt",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              for gokey in sorted(
+                  descendants,
+                  key=lambda x: full_path(x).lower()
+              ):
+
+                  for comp in components.get(gokey, []):
+
+                      if comp.type.name != "MonoBehaviour":
+                          continue
+
+                      info = script_info(comp)
+
+                      out.write(
+                          f"OBJECT: {full_path(gokey)}\n"
+                      )
+
+                      out.write(
+                          f"COMPONENT_PATHID: "
+                          f"{comp.path_id}\n"
+                      )
+
+                      out.write(
+                          f"SCRIPT: {info}\n\n"
+                      )
+
+          with open(
+              "work/pride-meshes.txt",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              for gokey in sorted(
+                  descendants,
+                  key=lambda x: full_path(x).lower()
+              ):
+
+                  for comp in components.get(gokey, []):
+
+                      if comp.type.name not in (
+                          "MeshFilter",
+                          "MeshRenderer",
+                          "SkinnedMeshRenderer"
+                      ):
+                          continue
+
+                      out.write(
+                          f"OBJECT: {full_path(gokey)}\n"
+                      )
+
+                      out.write(
+                          f"COMPONENT: "
+                          f"{comp.type.name}\n"
+                      )
+
+                      out.write(
+                          f"PATHID: {comp.path_id}\n"
+                      )
+
+                      out.write(
+                          f"DETAILS: "
+                          f"{component_details(comp)}\n\n"
+                      )
+
+          print("Pride roots:", len(pride_roots))
+          print("Pride GameObjects:", len(descendants))
+          print("Reports generated successfully")
+          PY
+
+      - name: Show important Pride objects
+        run: |
+          grep -Ei \
+          "wheel|collider|rigidbody|seat|steering|door|engine|mesh|body|hood|trunk" \
+          work/pride-components.tsv \
+          | head -n 300 \
+          > work/pride-important.txt || true
+
+          cat work/pride-important.txt
+
+      - name: Upload Pride reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAC-Pride-Deep-Scan
+          path: |
+            work/pride-hierarchy.txt
+            work/pride-components.tsv
+            work/pride-scripts.txt
+            work/pride-meshes.txt
+            work/pride-important.txt
