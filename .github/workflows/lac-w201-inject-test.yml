@@ -1,0 +1,1014 @@
+name: Build LAC Mercedes W201 Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download base XAPK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input work/xapk work/obb
+
+          gh release download v1.0-base \
+            --pattern '*.xapk' \
+            --dir input
+
+          XAPK=$(find input -name "*.xapk" | head -n 1)
+
+          echo "XAPK=$XAPK"
+
+          unzip -q "$XAPK" -d work/xapk
+
+          OBB=$(find work/xapk -name "*.obb" | head -n 1)
+
+          if [ -z "$OBB" ]; then
+            echo "OBB NOT FOUND"
+            exit 1
+          fi
+
+          echo "$OBB" > work/original-obb-path.txt
+
+          unzip -q "$OBB" -d work/obb
+
+      - name: Install Python tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install UnityPy trimesh numpy scipy networkx
+
+      - name: Inject Mercedes W201 meshes
+        run: |
+          python - <<'PY'
+          import os
+          import copy
+          import struct
+          import numpy as np
+          import trimesh
+          import UnityPy
+
+          GAME = "work/obb/assets/bin/Data/data.unity3d"
+          W201 = "MercedesW201/Models/1982_mercedes_w201.glb"
+          REPORT = "work/inject-report.txt"
+
+          TARGET_MESHES = {
+              "Body": 886,
+              "Door_FL": 996,
+              "Door_FR": 1003,
+              "Door_RL": 1009,
+              "Door_RR": 1015,
+              "Hood": 982,
+              "Trunk": 1020,
+          }
+
+          MOVING_TARGETS = {
+              "Door_FL": {
+                  "center": np.array([
+                      -0.701055,
+                       0.181479,
+                      -0.753107
+                  ]),
+                  "extents": np.array([
+                      0.251228,
+                      1.095754,
+                      0.762524
+                  ])
+              },
+
+              "Door_FR": {
+                  "center": np.array([
+                       0.701055,
+                       0.181479,
+                      -0.753107
+                  ]),
+                  "extents": np.array([
+                      0.251228,
+                      1.095754,
+                      0.762524
+                  ])
+              },
+
+              "Door_RL": {
+                  "center": np.array([
+                      -0.701001,
+                      -0.785976,
+                      -0.753089
+                  ]),
+                  "extents": np.array([
+                      0.251135,
+                      0.997728,
+                      0.762325
+                  ])
+              },
+
+              "Door_RR": {
+                  "center": np.array([
+                       0.701001,
+                      -0.785976,
+                      -0.753089
+                  ]),
+                  "extents": np.array([
+                      0.251135,
+                      0.997728,
+                      0.762325
+                  ])
+              },
+
+              "Hood": {
+                  "center": np.array([
+                       0.0,
+                       1.307311,
+                      -0.691777
+                  ]),
+                  "extents": np.array([
+                      1.405602,
+                      1.174704,
+                      0.199754
+                  ])
+              },
+
+              "Trunk": {
+                  "center": np.array([
+                       0.000001,
+                      -1.972847,
+                      -0.698122
+                  ]),
+                  "extents": np.array([
+                      1.259136,
+                      0.630947,
+                      0.247513
+                  ])
+              },
+          }
+
+          WHEEL_CENTERS = {
+              "FL": np.array([
+                  -0.824057,
+                   1.321835,
+                  -0.191801
+              ]),
+
+              "FR": np.array([
+                   0.824057,
+                   1.321598,
+                  -0.191797
+              ]),
+
+              "RL": np.array([
+                  -0.816269,
+                  -1.313133,
+                  -0.169002
+              ]),
+
+              "RR": np.array([
+                   0.816269,
+                  -1.313370,
+                  -0.168998
+              ]),
+          }
+
+          print("Loading Mercedes W201...")
+
+          source_scene = trimesh.load(
+              W201,
+              force="scene"
+          )
+
+          parts = []
+
+          for mesh_name, mesh in source_scene.geometry.items():
+
+              try:
+                  pieces = list(
+                      mesh.split(
+                          only_watertight=False
+                      )
+                  )
+              except Exception:
+                  pieces = [mesh]
+
+              for part in pieces:
+
+                  if len(part.faces) < 20:
+                      continue
+
+                  bounds = np.asarray(
+                      part.bounds,
+                      dtype=np.float64
+                  )
+
+                  center = bounds.mean(axis=0)
+
+                  extents = np.asarray(
+                      part.extents,
+                      dtype=np.float64
+                  )
+
+                  parts.append({
+                      "source": mesh_name,
+                      "mesh": part.copy(),
+                      "center": center,
+                      "extents": extents,
+                      "faces": len(part.faces)
+                  })
+
+          print(
+              "Connected W201 parts:",
+              len(parts)
+          )
+
+          def selection_score(part, target):
+
+              ce = np.linalg.norm(
+                  (
+                      part["center"]
+                      - target["center"]
+                  )
+                  / np.maximum(
+                      target["extents"],
+                      0.1
+                  )
+              )
+
+              ee = np.linalg.norm(
+                  (
+                      part["extents"]
+                      - target["extents"]
+                  )
+                  / np.maximum(
+                      target["extents"],
+                      0.1
+                  )
+              )
+
+              return ce * 3.0 + ee
+
+          selected_indices = {}
+          excluded = set()
+
+          for name, target in MOVING_TARGETS.items():
+
+              ranked = []
+
+              for index, part in enumerate(parts):
+
+                  if index in excluded:
+                      continue
+
+                  ranked.append(
+                      (
+                          selection_score(
+                              part,
+                              target
+                          ),
+                          index
+                      )
+                  )
+
+              ranked.sort(
+                  key=lambda x: x[0]
+              )
+
+              score, index = ranked[0]
+
+              selected_indices[name] = index
+              excluded.add(index)
+
+              print(
+                  name,
+                  "source=",
+                  parts[index]["source"],
+                  "score=",
+                  round(score, 5)
+              )
+
+          # Remove W201 wheels from static body.
+          for wheel_name, wheel_center in WHEEL_CENTERS.items():
+
+              for index, part in enumerate(parts):
+
+                  if part["source"] != "Object_22":
+                      continue
+
+                  delta = np.abs(
+                      part["center"]
+                      - wheel_center
+                  )
+
+                  if (
+                      delta[0] < 0.35
+                      and
+                      delta[1] < 0.40
+                      and
+                      delta[2] < 0.40
+                  ):
+                      excluded.add(index)
+
+          body_parts = []
+
+          for index, part in enumerate(parts):
+
+              if index in excluded:
+                  continue
+
+              body_parts.append(
+                  part["mesh"].copy()
+              )
+
+          body_static = trimesh.util.concatenate(
+              body_parts
+          )
+
+          source_meshes = {
+              "Body": body_static,
+
+              "Door_FL":
+                  parts[
+                      selected_indices["Door_FL"]
+                  ]["mesh"].copy(),
+
+              "Door_FR":
+                  parts[
+                      selected_indices["Door_FR"]
+                  ]["mesh"].copy(),
+
+              "Door_RL":
+                  parts[
+                      selected_indices["Door_RL"]
+                  ]["mesh"].copy(),
+
+              "Door_RR":
+                  parts[
+                      selected_indices["Door_RR"]
+                  ]["mesh"].copy(),
+
+              "Hood":
+                  parts[
+                      selected_indices["Hood"]
+                  ]["mesh"].copy(),
+
+              "Trunk":
+                  parts[
+                      selected_indices["Trunk"]
+                  ]["mesh"].copy(),
+          }
+
+          print("Loading LAC Unity bundle...")
+
+          env = UnityPy.load(GAME)
+
+          def asset_basename(obj):
+
+              af = getattr(
+                  obj,
+                  "assets_file",
+                  None
+              )
+
+              name = getattr(
+                  af,
+                  "name",
+                  ""
+              ) or ""
+
+              return os.path.basename(name)
+
+          target_objects = {}
+
+          for obj in env.objects:
+
+              if obj.type.name != "Mesh":
+                  continue
+
+              if asset_basename(obj) != "sharedassets1.assets":
+                  continue
+
+              for logical_name, mesh_pid in TARGET_MESHES.items():
+
+                  if obj.path_id == mesh_pid:
+                      target_objects[
+                          logical_name
+                      ] = obj
+
+          missing = (
+              set(TARGET_MESHES)
+              - set(target_objects)
+          )
+
+          if missing:
+
+              raise RuntimeError(
+                  "Missing target meshes: "
+                  + ", ".join(
+                      sorted(missing)
+                  )
+              )
+
+          def vec3_dict(v):
+
+              return {
+                  "x": float(v[0]),
+                  "y": float(v[1]),
+                  "z": float(v[2]),
+              }
+
+          def read_aabb(aabb):
+
+              center_obj = aabb["m_Center"]
+              extent_obj = aabb["m_Extent"]
+
+              center = np.array([
+                  center_obj["x"],
+                  center_obj["y"],
+                  center_obj["z"]
+              ], dtype=np.float64)
+
+              extent = np.array([
+                  extent_obj["x"],
+                  extent_obj["y"],
+                  extent_obj["z"]
+              ], dtype=np.float64)
+
+              return center, extent
+
+          def write_aabb(
+              aabb,
+              center,
+              extent
+          ):
+
+              aabb["m_Center"] = vec3_dict(
+                  center
+              )
+
+              aabb["m_Extent"] = vec3_dict(
+                  extent
+              )
+
+          def transform_w201_vertices(
+              mesh,
+              target_center,
+              target_extent
+          ):
+
+              source = np.asarray(
+                  mesh.vertices,
+                  dtype=np.float64
+              )
+
+              # W201:
+              # X = left/right
+              # Y = front/rear
+              # Z = height
+              #
+              # Unity:
+              # X = left/right
+              # Y = up
+              # Z = forward
+              converted = np.column_stack([
+                  source[:, 0],
+                  -source[:, 2],
+                  source[:, 1]
+              ])
+
+              src_min = converted.min(axis=0)
+              src_max = converted.max(axis=0)
+
+              src_center = (
+                  src_min + src_max
+              ) * 0.5
+
+              src_extent = (
+                  src_max - src_min
+              ) * 0.5
+
+              src_extent = np.maximum(
+                  src_extent,
+                  0.000001
+              )
+
+              # Fit W201 part exactly inside
+              # the donor Pride mesh bounds.
+              scale = (
+                  target_extent
+                  / src_extent
+              )
+
+              converted = (
+                  converted
+                  - src_center
+              ) * scale + target_center
+
+              return converted.astype(
+                  np.float32
+              )
+
+          def build_vertex_buffer(
+              vertices,
+              faces
+          ):
+
+              temp = trimesh.Trimesh(
+                  vertices=vertices.copy(),
+                  faces=faces.copy(),
+                  process=False
+              )
+
+              temp.fix_normals()
+
+              normals = np.asarray(
+                  temp.vertex_normals,
+                  dtype=np.float32
+              )
+
+              count = len(vertices)
+
+              data = np.zeros(
+                  (count, 14),
+                  dtype="<f4"
+              )
+
+              # position
+              data[:, 0:3] = vertices
+
+              # normal
+              data[:, 3:6] = normals
+
+              # tangent
+              data[:, 6] = 1.0
+              data[:, 7] = 0.0
+              data[:, 8] = 0.0
+              data[:, 9] = 1.0
+
+              # basic generated UV0
+              mins = vertices.min(axis=0)
+              maxs = vertices.max(axis=0)
+
+              ranges = np.maximum(
+                  maxs - mins,
+                  0.000001
+              )
+
+              data[:, 10] = (
+                  vertices[:, 0]
+                  - mins[0]
+              ) / ranges[0]
+
+              data[:, 11] = (
+                  vertices[:, 2]
+                  - mins[2]
+              ) / ranges[2]
+
+              # UV1 = UV0
+              data[:, 12] = data[:, 10]
+              data[:, 13] = data[:, 11]
+
+              return data.tobytes()
+
+          def make_channels():
+
+              channels = []
+
+              layout = {
+                  0: (0, 3),
+                  1: (12, 3),
+                  2: (24, 4),
+                  4: (40, 2),
+                  5: (48, 2),
+              }
+
+              for index in range(14):
+
+                  offset, dimension = layout.get(
+                      index,
+                      (0, 0)
+                  )
+
+                  channels.append({
+                      "stream": 0,
+                      "offset": offset,
+                      "format": 0,
+                      "dimension": dimension,
+                  })
+
+              return channels
+
+          report_lines = []
+
+          for logical_name in (
+              "Body",
+              "Door_FL",
+              "Door_FR",
+              "Door_RL",
+              "Door_RR",
+              "Hood",
+              "Trunk"
+          ):
+
+              obj = target_objects[
+                  logical_name
+              ]
+
+              tree = obj.read_typetree()
+
+              source_mesh = source_meshes[
+                  logical_name
+              ]
+
+              donor_center, donor_extent = (
+                  read_aabb(
+                      tree["m_LocalAABB"]
+                  )
+              )
+
+              vertices = (
+                  transform_w201_vertices(
+                      source_mesh,
+                      donor_center,
+                      donor_extent
+                  )
+              )
+
+              faces = np.asarray(
+                  source_mesh.faces,
+                  dtype=np.int64
+              )
+
+              if len(vertices) == 0:
+                  raise RuntimeError(
+                      logical_name
+                      + ": zero vertices"
+                  )
+
+              if len(faces) == 0:
+                  raise RuntimeError(
+                      logical_name
+                      + ": zero faces"
+                  )
+
+              new_min = vertices.min(axis=0)
+              new_max = vertices.max(axis=0)
+
+              new_center = (
+                  new_min + new_max
+              ) * 0.5
+
+              new_extent = (
+                  new_max - new_min
+              ) * 0.5
+
+              indices = faces.reshape(-1)
+
+              use_32bit = (
+                  len(vertices) > 65535
+                  or int(indices.max()) > 65535
+              )
+
+              if use_32bit:
+
+                  index_buffer = np.asarray(
+                      indices,
+                      dtype="<u4"
+                  ).tobytes()
+
+                  index_format = 1
+
+              else:
+
+                  index_buffer = np.asarray(
+                      indices,
+                      dtype="<u2"
+                  ).tobytes()
+
+                  index_format = 0
+
+              vertex_buffer = (
+                  build_vertex_buffer(
+                      vertices,
+                      faces
+                  )
+              )
+
+              old_submeshes = tree[
+                  "m_SubMeshes"
+              ]
+
+              if not old_submeshes:
+                  raise RuntimeError(
+                      logical_name
+                      + ": donor has no submesh"
+                  )
+
+              submesh = copy.deepcopy(
+                  old_submeshes[0]
+              )
+
+              submesh["firstByte"] = 0
+              submesh["indexCount"] = int(
+                  len(indices)
+              )
+              submesh["topology"] = 0
+
+              if "baseVertex" in submesh:
+                  submesh["baseVertex"] = 0
+
+              if "firstVertex" in submesh:
+                  submesh["firstVertex"] = 0
+
+              if "vertexCount" in submesh:
+                  submesh["vertexCount"] = int(
+                      len(vertices)
+                  )
+
+              if "localAABB" in submesh:
+
+                  write_aabb(
+                      submesh["localAABB"],
+                      new_center,
+                      new_extent
+                  )
+
+              tree["m_SubMeshes"] = [
+                  submesh
+              ]
+
+              if "m_IndexFormat" in tree:
+                  tree[
+                      "m_IndexFormat"
+                  ] = index_format
+
+              tree["m_IndexBuffer"] = (
+                  index_buffer
+              )
+
+              vertex_data = tree[
+                  "m_VertexData"
+              ]
+
+              vertex_data[
+                  "m_VertexCount"
+              ] = int(
+                  len(vertices)
+              )
+
+              vertex_data[
+                  "m_Channels"
+              ] = make_channels()
+
+              vertex_data[
+                  "m_DataSize"
+              ] = vertex_buffer
+
+              write_aabb(
+                  tree["m_LocalAABB"],
+                  new_center,
+                  new_extent
+              )
+
+              if "m_MeshCompression" in tree:
+                  tree[
+                      "m_MeshCompression"
+                  ] = 0
+
+              if "m_IsReadable" in tree:
+                  tree["m_IsReadable"] = True
+
+              if "m_KeepVertices" in tree:
+                  tree["m_KeepVertices"] = True
+
+              if "m_KeepIndices" in tree:
+                  tree["m_KeepIndices"] = True
+
+              if "m_StreamData" in tree:
+
+                  stream = tree[
+                      "m_StreamData"
+                  ]
+
+                  if "offset" in stream:
+                      stream["offset"] = 0
+
+                  if "size" in stream:
+                      stream["size"] = 0
+
+                  if "path" in stream:
+                      stream["path"] = ""
+
+              # Write modified typetree.
+              try:
+                  obj.save_typetree(tree)
+              except AttributeError:
+                  obj.patch(tree)
+
+              line = (
+                  f"{logical_name}: "
+                  f"Mesh PathID={obj.path_id}, "
+                  f"vertices={len(vertices)}, "
+                  f"triangles={len(faces)}, "
+                  f"indexFormat="
+                  f"{'UInt32' if use_32bit else 'UInt16'}"
+              )
+
+              print(line)
+              report_lines.append(line)
+
+          print("Saving modified Unity bundle...")
+
+          try:
+              modified = env.file.save(
+                  "original"
+              )
+          except Exception as first_error:
+
+              print(
+                  "Original packer failed:",
+                  first_error
+              )
+
+              print(
+                  "Trying LZ4..."
+              )
+
+              modified = env.file.save(
+                  "lz4"
+              )
+
+          with open(
+              GAME,
+              "wb"
+          ) as f:
+
+              f.write(modified)
+
+          print(
+              "Modified bundle size:",
+              len(modified)
+          )
+
+          with open(
+              REPORT,
+              "w",
+              encoding="utf-8"
+          ) as f:
+
+              f.write(
+                  "Mercedes W201 → Vehicle_Pride\n"
+              )
+
+              f.write(
+                  "============================\n\n"
+              )
+
+              for line in report_lines:
+                  f.write(
+                      line + "\n"
+                  )
+
+          print("Injection complete.")
+          PY
+
+      - name: Verify modified bundle
+        run: |
+          python - <<'PY'
+          import os
+          import UnityPy
+
+          target = "work/obb/assets/bin/Data/data.unity3d"
+
+          env = UnityPy.load(target)
+
+          expected = {
+              886: "Body",
+              996: "Door_FL",
+              1003: "Door_FR",
+              1009: "Door_RL",
+              1015: "Door_RR",
+              982: "Hood",
+              1020: "Trunk",
+          }
+
+          found = set()
+
+          for obj in env.objects:
+
+              af = getattr(
+                  obj,
+                  "assets_file",
+                  None
+              )
+
+              asset_name = os.path.basename(
+                  getattr(
+                      af,
+                      "name",
+                      ""
+                  ) or ""
+              )
+
+              if asset_name != "sharedassets1.assets":
+                  continue
+
+              if obj.path_id not in expected:
+                  continue
+
+              if obj.type.name != "Mesh":
+                  continue
+
+              mesh = obj.read()
+
+              count = (
+                  mesh
+                  .m_VertexData
+                  .m_VertexCount
+              )
+
+              print(
+                  expected[obj.path_id],
+                  "PathID=",
+                  obj.path_id,
+                  "VertexCount=",
+                  count,
+                  "SubMeshes=",
+                  len(mesh.m_SubMeshes)
+              )
+
+              if count <= 0:
+                  raise RuntimeError(
+                      "Invalid mesh "
+                      + expected[obj.path_id]
+                  )
+
+              found.add(obj.path_id)
+
+          if found != set(expected):
+
+              raise RuntimeError(
+                  "Modified mesh verification failed"
+              )
+
+          print(
+              "ALL 7 MODIFIED MESHES VERIFIED"
+          )
+          PY
+
+      - name: Rebuild OBB
+        run: |
+          ORIGINAL_OBB=$(cat work/original-obb-path.txt)
+          OBB_NAME=$(basename "$ORIGINAL_OBB")
+
+          echo "Original OBB name: $OBB_NAME"
+
+          cd work/obb
+
+          zip -0 -q -r \
+            "../$OBB_NAME" \
+            .
+
+          cd ../..
+
+          ls -lh "work/$OBB_NAME"
+
+          cp \
+            "work/$OBB_NAME" \
+            "$ORIGINAL_OBB"
+
+      - name: Build modified XAPK
+        run: |
+          cd work/xapk
+
+          zip -0 -q -r \
+            ../LAC-W201-Pride-Test.xapk \
+            .
+
+          cd ../..
+
+          ls -lh \
+            work/LAC-W201-Pride-Test.xapk
+
+      - name: Final XAPK check
+        run: |
+          unzip -t \
+            work/LAC-W201-Pride-Test.xapk
+
+          echo ""
+          echo "===== INJECTION REPORT ====="
+
+          cat work/inject-report.txt
+
+      - name: Upload modified game
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAC-W201-Pride-Test-XAPK
+          compression-level: 0
+          path: |
+            work/LAC-W201-Pride-Test.xapk
+            work/inject-report.txt
