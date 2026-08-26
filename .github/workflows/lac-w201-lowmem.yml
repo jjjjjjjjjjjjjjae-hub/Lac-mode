@@ -387,26 +387,18 @@ jobs:
           name: W201-Prepared-LowMem
           path: work/prepared
 
-      - name: Enable swap and show memory
+      - name: Show available memory
         run: |
-          echo "===== BEFORE SWAP ====="
+          echo "===== MEMORY ====="
           free -h
-          df -h
-
-          sudo fallocate -l 8G /swapfile || \
-            sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-
-          sudo swapon /swapfile || true
-          sudo sysctl vm.swappiness=100 || true
 
           echo ""
-          echo "===== AFTER SWAP ====="
-          free -h
+          echo "===== SWAP ====="
           swapon --show || true
 
+          echo ""
+          echo "===== DISK ====="
+          df -h
       - name: Download base XAPK
         env:
           GH_TOKEN: ${{ github.token }}
