@@ -1,0 +1,248 @@
+name: LAC Vehicle Hierarchy Scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download XAPK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input
+          gh release download v1.0-base --pattern '*.xapk' --dir input
+          ls -lh input
+
+      - name: Extract XAPK and OBB
+        run: |
+          mkdir -p work/xapk work/obb
+
+          XAPK=$(find input -name "*.xapk" | head -n 1)
+          echo "XAPK=$XAPK"
+          unzip -q "$XAPK" -d work/xapk
+
+          OBB=$(find work/xapk -name "*.obb" | head -n 1)
+          echo "OBB=$OBB"
+
+          if [ -z "$OBB" ]; then
+            echo "OBB NOT FOUND"
+            exit 1
+          fi
+
+          unzip -l "$OBB" | tee work/obb-report.txt
+          unzip -q "$OBB" -d work/obb
+
+      - name: Install UnityPy
+        run: |
+          python -m pip install --upgrade pip
+          pip install UnityPy
+
+      - name: Scan vehicle hierarchy
+        run: |
+          python - <<'PY'
+          import os
+          from collections import defaultdict
+          import UnityPy
+
+          target = "work/obb/assets/bin/Data/data.unity3d"
+          if not os.path.exists(target):
+              print("data.unity3d NOT FOUND:", target)
+              raise SystemExit(1)
+
+          env = UnityPy.load(target)
+          objects = list(env.objects)
+
+          donor_terms = [
+              "Vehicle_Pride",
+              "Vehicle_Chevelle",
+              "Vehicle_Zupra",
+              "Vehicle_Elissan",
+              "Vehicle_Sprinter",
+              "Vehicle_Marock",
+              "Vehicle_King",
+              "Vehicle_Hummingbird",
+              "Vehicle_JTM",
+              "Npc_Vehicle(Golf)"
+          ]
+
+          focus_terms = [
+              "wheel",
+              "wheelcollider",
+              "carcolliders",
+              "seat",
+              "driveseat",
+              "steering",
+              "engine",
+              "radio",
+              "door",
+              "trigger"
+          ]
+
+          read_cache = {}
+
+          def safe_read(obj):
+              pid = obj.path_id
+              if pid in read_cache:
+                  return read_cache[pid]
+              try:
+                  data = obj.read()
+              except Exception:
+                  data = None
+              read_cache[pid] = data
+              return data
+
+          go_by_id = {}
+          go_name_by_id = {}
+          components_by_goid = defaultdict(list)
+          transform_by_goid = {}
+          transform_pid_to_goid = {}
+          parent_by_goid = {}
+          children_by_goid = defaultdict(list)
+
+          for obj in objects:
+              data = safe_read(obj)
+              if data is None:
+                  continue
+
+              typ = obj.type.name
+
+              if typ == "GameObject":
+                  goid = obj.path_id
+                  go_by_id[goid] = data
+                  go_name_by_id[goid] = getattr(data, "m_Name", "") or ""
+
+                  try:
+                      for comp in data.m_Components:
+                          try:
+                              ctype = comp.component.type.name
+                          except Exception:
+                              ctype = "Unknown"
+                          components_by_goid[goid].append(ctype)
+                  except Exception:
+                      pass
+
+              elif typ == "Transform":
+                  try:
+                      goid = data.m_GameObject.path_id
+                      transform_by_goid[goid] = data
+                      transform_pid_to_goid[obj.path_id] = goid
+                  except Exception:
+                      pass
+
+          for goid, tdata in transform_by_goid.items():
+              try:
+                  parent_transform_pid = tdata.m_Father.path_id
+              except Exception:
+                  parent_transform_pid = 0
+
+              parent_goid = transform_pid_to_goid.get(parent_transform_pid)
+              if parent_goid:
+                  parent_by_goid[goid] = parent_goid
+                  children_by_goid[parent_goid].append(goid)
+
+          def go_name(goid):
+              return go_name_by_id.get(goid, "")
+
+          def comp_list(goid):
+              return components_by_goid.get(goid, [])
+
+          def full_path(goid):
+              parts = []
+              seen = set()
+              cur = goid
+              while cur and cur not in seen:
+                  seen.add(cur)
+                  name = go_name(cur)
+                  if name:
+                      parts.append(name)
+                  cur = parent_by_goid.get(cur)
+              return "/".join(reversed(parts))
+
+          vehicle_roots = []
+          for goid, name in go_name_by_id.items():
+              low = name.lower()
+              if any(term.lower() in low for term in donor_terms):
+                  vehicle_roots.append((name, goid))
+
+          vehicle_roots.sort(key=lambda x: x[0].lower())
+
+          with open("work/vehicle-roots.txt", "w", encoding="utf-8") as out:
+              out.write("VEHICLE ROOT CANDIDATES\n")
+              out.write("=======================\n\n")
+              for name, goid in vehicle_roots:
+                  out.write(f"NAME: {name}\n")
+                  out.write(f"PATH: {full_path(goid)}\n")
+                  out.write(f"COMPONENTS: {', '.join(comp_list(goid))}\n")
+                  out.write("\n")
+
+          def dump_tree(goid, out, depth=0, visited=None):
+              if visited is None:
+                  visited = set()
+              if goid in visited:
+                  return
+              visited.add(goid)
+
+              indent = "  " * depth
+              name = go_name(goid)
+              comps = ", ".join(comp_list(goid))
+              out.write(f"{indent}- {name} [components: {comps}]\n")
+
+              kids = children_by_goid.get(goid, [])
+              kids = sorted(kids, key=lambda x: go_name(x).lower())
+
+              for child in kids:
+                  dump_tree(child, out, depth + 1, visited)
+
+          with open("work/vehicle-hierarchy.txt", "w", encoding="utf-8") as out:
+              out.write("DETAILED VEHICLE HIERARCHY\n")
+              out.write("==========================\n\n")
+
+              for name, goid in vehicle_roots:
+                  out.write(f"ROOT: {name}\n")
+                  out.write(f"FULL PATH: {full_path(goid)}\n")
+                  out.write(f"ROOT COMPONENTS: {', '.join(comp_list(goid))}\n")
+                  out.write("\n")
+                  dump_tree(goid, out, depth=0, visited=set())
+                  out.write("\n")
+                  out.write("-" * 80)
+                  out.write("\n\n")
+
+          focus_hits = []
+          for goid, name in go_name_by_id.items():
+              low = name.lower()
+              if any(term in low for term in focus_terms):
+                  focus_hits.append((name, goid, full_path(goid), comp_list(goid)))
+
+          focus_hits.sort(key=lambda x: x[2].lower())
+
+          with open("work/focus-components.txt", "w", encoding="utf-8") as out:
+              out.write("FOCUS VEHICLE OBJECTS\n")
+              out.write("=====================\n\n")
+              for name, goid, path, comps in focus_hits:
+                  out.write(f"NAME: {name}\n")
+                  out.write(f"PATH: {path}\n")
+                  out.write(f"COMPONENTS: {', '.join(comps)}\n")
+                  out.write("\n")
+
+          print("Vehicle roots found:", len(vehicle_roots))
+          print("Focus hits found:", len(focus_hits))
+          PY
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAC-Vehicle-Hierarchy
+          path: |
+            work/obb-report.txt
+            work/vehicle-roots.txt
+            work/vehicle-hierarchy.txt
+            work/focus-components.txt
