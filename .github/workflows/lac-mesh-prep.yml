@@ -1,0 +1,303 @@
+name: LAC Mesh Injection Prep
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download game
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input work/xapk work/obb
+          gh release download v1.0-base --pattern '*.xapk' --dir input
+
+          XAPK=$(find input -name "*.xapk" | head -n 1)
+          unzip -q "$XAPK" -d work/xapk
+
+          OBB=$(find work/xapk -name "*.obb" | head -n 1)
+          unzip -q "$OBB" -d work/obb
+
+      - name: Install UnityPy
+        run: |
+          pip install UnityPy
+
+      - name: Inspect target meshes
+        run: |
+          python - <<'PY'
+          import UnityPy
+
+          target = "work/obb/assets/bin/Data/data.unity3d"
+          env = UnityPy.load(target)
+
+          objects = list(env.objects)
+          by_pid = {o.path_id: o for o in objects}
+
+          cache = {}
+
+          def read(o):
+              if o.path_id in cache:
+                  return cache[o.path_id]
+              try:
+                  d = o.read()
+              except Exception:
+                  d = None
+              cache[o.path_id] = d
+              return d
+
+          def pid(ptr):
+              if ptr is None:
+                  return 0
+              return (
+                  getattr(ptr, "path_id", 0)
+                  or getattr(ptr, "m_PathID", 0)
+                  or 0
+              )
+
+          wanted = {
+              "Body",
+              "Door_FL",
+              "Door_FR",
+              "Door_RL",
+              "Door_RR",
+              "Hood",
+              "Trunk",
+              "FL_Mesh",
+              "FR_Mesh",
+              "RL_Mesh",
+              "RR_Mesh"
+          }
+
+          out = open(
+              "work/mesh-injection-prep.txt",
+              "w",
+              encoding="utf-8"
+          )
+
+          out.write("UNITY FILE INFO\n")
+          out.write("================\n\n")
+
+          for name, f in env.files.items():
+              out.write(f"FILE: {name}\n")
+
+              for attr in (
+                  "unity_version",
+                  "version",
+                  "format_version"
+              ):
+                  try:
+                      out.write(
+                          f"{attr}: {getattr(f, attr)}\n"
+                      )
+                  except Exception:
+                      pass
+
+              try:
+                  out.write(
+                      f"header.version: {f.header.version}\n"
+                  )
+              except Exception:
+                  pass
+
+              out.write("\n")
+
+          out.write("\nTARGET GAMEOBJECTS\n")
+          out.write("==================\n\n")
+
+          for obj in objects:
+
+              if obj.type.name != "GameObject":
+                  continue
+
+              d = read(obj)
+
+              if d is None:
+                  continue
+
+              go_name = getattr(d, "m_Name", "") or ""
+
+              if go_name not in wanted:
+                  continue
+
+              out.write(
+                  f"GameObject: {go_name}\n"
+              )
+              out.write(
+                  f"GO PathID: {obj.path_id}\n"
+              )
+
+              comps = (
+                  getattr(d, "m_Component", None)
+                  or getattr(d, "m_Components", None)
+                  or []
+              )
+
+              for entry in comps:
+
+                  ptr = (
+                      getattr(entry, "component", None)
+                      or getattr(entry, "m_Component", None)
+                      or entry
+                  )
+
+                  cpid = pid(ptr)
+                  cobj = by_pid.get(cpid)
+
+                  if not cobj:
+                      continue
+
+                  out.write(
+                      f"  Component: {cobj.type.name} "
+                      f"PathID={cpid}\n"
+                  )
+
+                  if cobj.type.name == "MeshFilter":
+
+                      cd = read(cobj)
+
+                      if cd is None:
+                          continue
+
+                      mpid = pid(
+                          getattr(cd, "m_Mesh", None)
+                      )
+
+                      mobj = by_pid.get(mpid)
+
+                      mesh_name = ""
+
+                      if mobj:
+                          md = read(mobj)
+
+                          if md is not None:
+                              mesh_name = (
+                                  getattr(md, "m_Name", "")
+                                  or ""
+                              )
+
+                      out.write(
+                          f"    Mesh PathID={mpid}\n"
+                      )
+                      out.write(
+                          f"    Mesh Name={mesh_name}\n"
+                      )
+
+                      if mobj:
+                          md = read(mobj)
+
+                          try:
+                              out.write(
+                                  f"    IndexBuffer bytes="
+                                  f"{len(md.m_IndexBuffer)}\n"
+                              )
+                          except Exception:
+                              pass
+
+                          try:
+                              vd = md.m_VertexData
+                              out.write(
+                                  f"    VertexCount="
+                                  f"{vd.m_VertexCount}\n"
+                              )
+                          except Exception:
+                              pass
+
+                          try:
+                              sd = md.m_StreamData
+
+                              out.write(
+                                  f"    Stream path="
+                                  f"{sd.path}\n"
+                              )
+                              out.write(
+                                  f"    Stream offset="
+                                  f"{sd.offset}\n"
+                              )
+                              out.write(
+                                  f"    Stream size="
+                                  f"{sd.size}\n"
+                              )
+                          except Exception:
+                              pass
+
+              out.write("\n")
+
+          out.write("\nMESH OBJECT SEARCH\n")
+          out.write("==================\n\n")
+
+          mesh_names = {
+              "Body",
+              "Door_FL",
+              "Door_FR",
+              "Door_RL",
+              "Door_RR",
+              "Hood",
+              "Trunk"
+          }
+
+          for obj in objects:
+
+              if obj.type.name != "Mesh":
+                  continue
+
+              d = read(obj)
+
+              if d is None:
+                  continue
+
+              n = getattr(d, "m_Name", "") or ""
+
+              if n in mesh_names:
+
+                  out.write(
+                      f"Mesh {n}: PathID={obj.path_id}\n"
+                  )
+
+                  try:
+                      out.write(
+                          f"  VertexCount="
+                          f"{d.m_VertexData.m_VertexCount}\n"
+                      )
+                  except Exception:
+                      pass
+
+                  try:
+                      out.write(
+                          f"  IndexBuffer="
+                          f"{len(d.m_IndexBuffer)} bytes\n"
+                      )
+                  except Exception:
+                      pass
+
+                  try:
+                      out.write(
+                          f"  SubMeshes="
+                          f"{len(d.m_SubMeshes)}\n"
+                      )
+                  except Exception:
+                      pass
+
+                  out.write("\n")
+
+          out.close()
+
+          print(open(
+              "work/mesh-injection-prep.txt",
+              encoding="utf-8"
+          ).read())
+          PY
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAC-Mesh-Injection-Prep
+          path: work/mesh-injection-prep.txt
