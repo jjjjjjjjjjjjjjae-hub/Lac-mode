@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download LAC XAPK
+      - name: Download XAPK
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -22,86 +22,131 @@ jobs:
           gh release download v1.0-base \
             --pattern '*.xapk' \
             --dir input
-
-          echo "===== DOWNLOADED ====="
           ls -lh input
 
       - name: Extract XAPK
         run: |
           mkdir -p work/xapk
-          unzip -q "input/lac.mode.xapk" -d work/xapk
+          XAPK=$(find input -name "*.xapk" | head -n 1)
+          echo "XAPK=$XAPK"
+          unzip -q "$XAPK" -d work/xapk
+          find work/xapk -type f | tee work/xapk-files.txt
 
-          echo "===== XAPK CONTENT =====" | tee work/xapk-files.txt
-          find work/xapk -type f | tee -a work/xapk-files.txt
-
-      - name: Inspect APK
+      - name: Extract OBB
         run: |
-          APK=$(find work/xapk -type f -name "*.apk" | head -n 1)
-
-          echo "APK=$APK" | tee work/apk-report.txt
-
-          if [ -n "$APK" ]; then
-            echo "" >> work/apk-report.txt
-            echo "===== APK FILE LIST =====" >> work/apk-report.txt
-            unzip -l "$APK" >> work/apk-report.txt
-
-            echo "" >> work/apk-report.txt
-            echo "===== UNITY / IL2CPP =====" >> work/apk-report.txt
-            unzip -l "$APK" | grep -Ei \
-              "unity|il2cpp|global-metadata|assets|vehicle|car|animation|animator" \
-              >> work/apk-report.txt || true
-          fi
-
-      - name: Find OBB
-        run: |
-          OBB=$(find work/xapk -type f -name "*.obb" | head -n 1)
-
-          echo "OBB=$OBB" | tee work/obb-report.txt
+          OBB=$(find work/xapk -name "*.obb" | head -n 1)
+          echo "OBB=$OBB"
 
           if [ -z "$OBB" ]; then
             echo "OBB NOT FOUND"
             exit 1
           fi
 
-          file "$OBB" | tee -a work/obb-report.txt
-          ls -lh "$OBB" | tee -a work/obb-report.txt
-
-      - name: Extract OBB
-        run: |
-          OBB=$(find work/xapk -type f -name "*.obb" | head -n 1)
-
           mkdir -p work/obb
-
-          echo "===== OBB FILE LIST =====" >> work/obb-report.txt
-          unzip -l "$OBB" | tee -a work/obb-report.txt
-
+          unzip -l "$OBB" | tee work/obb-report.txt
           unzip -q "$OBB" -d work/obb
 
-      - name: Search Unity vehicle files
+          echo "===== FILES =====" | tee work/vehicle-search.txt
+          find work/obb -type f | tee -a work/vehicle-search.txt
+
+      - name: Install UnityPy
         run: |
-          echo "===== POSSIBLE VEHICLE / UNITY FILES =====" \
-            | tee work/vehicle-search.txt
+          python -m pip install --upgrade pip
+          pip install UnityPy
 
-          find work/obb -type f | grep -Ei \
-            "car|vehicle|wheel|drive|motor|engine|animation|animator|controller|prefab|sharedassets|resources|globalgamemanagers|level|data" \
-            | tee -a work/vehicle-search.txt || true
-
-          echo "" >> work/vehicle-search.txt
-          echo "===== ALL EXTRACTED FILES =====" >> work/vehicle-search.txt
-          find work/obb -type f >> work/vehicle-search.txt
-
-      - name: Show Mercedes model
+      - name: Scan Unity objects
         run: |
-          echo "===== MERCEDES MODEL ====="
+          python - <<'PY'
+          import os
+          import UnityPy
+
+          target = "work/obb/assets/bin/Data/data.unity3d"
+          output = "work/unity-objects.txt"
+
+          keywords = (
+              "car",
+              "vehicle",
+              "wheel",
+              "tire",
+              "tyre",
+              "engine",
+              "motor",
+              "drive",
+              "steer",
+              "sedan",
+              "truck",
+              "bike",
+              "animation",
+              "animator"
+          )
+
+          print("Scanning:", target)
+
+          if not os.path.exists(target):
+              print("data.unity3d NOT FOUND")
+
+              for root, dirs, files in os.walk("work/obb"):
+                  for f in files:
+                      print(os.path.join(root, f))
+
+              raise SystemExit(1)
+
+          env = UnityPy.load(target)
+
+          total = 0
+          matches = 0
+
+          with open(output, "w", encoding="utf-8") as out:
+
+              for obj in env.objects:
+                  total += 1
+
+                  try:
+                      data = obj.read()
+                      obj_type = obj.type.name
+                      name = getattr(data, "m_Name", "") or ""
+
+                      line = f"{obj_type}: {name}"
+                      out.write(line + "\n")
+
+                      low = name.lower()
+
+                      if any(k in low for k in keywords):
+                          matches += 1
+                          print("MATCH:", line)
+
+                  except Exception as e:
+                      pass
+
+              out.write("\n")
+              out.write(f"TOTAL OBJECTS: {total}\n")
+              out.write(f"KEYWORD MATCHES: {matches}\n")
+
+          print("Total objects:", total)
+          print("Matches:", matches)
+          PY
+
+      - name: Filter vehicle objects
+        run: |
+          grep -Ei \
+          "car|vehicle|wheel|tire|tyre|engine|motor|drive|steer|sedan|truck|bike|animation|animator" \
+          work/unity-objects.txt \
+          > work/vehicle-objects.txt || true
+
+          echo "===== VEHICLE MATCHES ====="
+          cat work/vehicle-objects.txt || true
+
+      - name: Mercedes model check
+        run: |
           ls -lh MercedesW201/Models/1982_mercedes_w201.glb
 
-      - name: Upload inspection reports
+      - name: Upload reports
         uses: actions/upload-artifact@v4
         with:
-          name: LAC-XAPK-Inspection
+          name: LAC-Unity-Deep-Inspection
           path: |
             work/xapk-files.txt
-            work/apk-report.txt
             work/obb-report.txt
             work/vehicle-search.txt
-
+            work/unity-objects.txt
+            work/vehicle-objects.txt
