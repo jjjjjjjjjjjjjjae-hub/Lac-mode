@@ -1,0 +1,115 @@
+name: Mercedes W201 GLB Scan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GLB tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install trimesh pygltflib
+
+      - name: Scan Mercedes GLB
+        run: |
+          mkdir -p work
+
+          python - <<'PY'
+          from pygltflib import GLTF2
+          import trimesh
+
+          path = "MercedesW201/Models/1982_mercedes_w201.glb"
+
+          gltf = GLTF2().load(path)
+
+          with open("work/w201-nodes.txt", "w", encoding="utf-8") as out:
+              out.write("MERCEDES W201 NODES\n")
+              out.write("===================\n\n")
+
+              for i, node in enumerate(gltf.nodes):
+                  out.write(
+                      f"NODE {i}\n"
+                      f"Name: {node.name}\n"
+                      f"Mesh: {node.mesh}\n"
+                      f"Children: {node.children}\n"
+                      f"Translation: {node.translation}\n"
+                      f"Rotation: {node.rotation}\n"
+                      f"Scale: {node.scale}\n\n"
+                  )
+
+          with open("work/w201-gltf-meshes.txt", "w", encoding="utf-8") as out:
+              out.write("MERCEDES W201 GLTF MESHES\n")
+              out.write("=========================\n\n")
+
+              for i, mesh in enumerate(gltf.meshes):
+                  out.write(
+                      f"MESH {i}: {mesh.name}\n"
+                      f"Primitives: {len(mesh.primitives)}\n\n"
+                  )
+
+          scene = trimesh.load(path, force="scene")
+
+          with open("work/w201-geometry.txt", "w", encoding="utf-8") as out:
+              out.write("MERCEDES W201 GEOMETRY\n")
+              out.write("======================\n\n")
+
+              out.write(f"Geometry count: {len(scene.geometry)}\n")
+              out.write(f"Scene bounds: {scene.bounds}\n")
+              out.write(f"Scene extents: {scene.extents}\n\n")
+
+              for name, geo in scene.geometry.items():
+                  out.write(f"GEOMETRY: {name}\n")
+                  out.write(f"Vertices: {len(geo.vertices)}\n")
+                  out.write(f"Faces: {len(geo.faces)}\n")
+                  out.write(f"Bounds: {geo.bounds}\n")
+                  out.write(f"Extents: {geo.extents}\n")
+                  out.write("\n")
+
+          keywords = (
+              "door", "wheel", "tire", "tyre",
+              "hood", "bonnet", "trunk", "boot",
+              "body", "seat", "glass", "window",
+              "steer", "rim"
+          )
+
+          with open("work/w201-important.txt", "w", encoding="utf-8") as out:
+
+              for i, node in enumerate(gltf.nodes):
+                  name = node.name or ""
+
+                  if any(k in name.lower() for k in keywords):
+                      out.write(
+                          f"NODE {i}: {name} | mesh={node.mesh}\n"
+                      )
+
+              out.write("\nGEOMETRIES\n")
+
+              for name in scene.geometry:
+                  if any(k in name.lower() for k in keywords):
+                      out.write(name + "\n")
+
+          print("Nodes:", len(gltf.nodes))
+          print("Meshes:", len(gltf.meshes))
+          print("Geometries:", len(scene.geometry))
+          print("Extents:", scene.extents)
+          PY
+
+      - name: Show important parts
+        run: |
+          cat work/w201-important.txt
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mercedes-W201-GLB-Scan
+          path: |
+            work/w201-nodes.txt
+            work/w201-gltf-meshes.txt
+            work/w201-geometry.txt
+            work/w201-important.txt
