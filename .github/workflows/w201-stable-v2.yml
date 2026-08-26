@@ -1,0 +1,592 @@
+name: W201 Stable Parts Export V2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install trimesh numpy scipy networkx
+
+      - name: Build corrected W201
+        run: |
+          mkdir -p work/w201_v2
+
+          python - <<'PY'
+          import os
+          import numpy as np
+          import trimesh
+
+          SOURCE = "MercedesW201/Models/1982_mercedes_w201.glb"
+          OUT = "work/w201_v2"
+
+          scene = trimesh.load(
+              SOURCE,
+              force="scene"
+          )
+
+          parts = []
+
+          for mesh_name, mesh in scene.geometry.items():
+
+              try:
+                  pieces = list(
+                      mesh.split(
+                          only_watertight=False
+                      )
+                  )
+              except Exception:
+                  pieces = [mesh]
+
+              for p in pieces:
+
+                  if len(p.faces) < 20:
+                      continue
+
+                  bounds = np.asarray(p.bounds)
+                  center = bounds.mean(axis=0)
+                  extents = np.asarray(p.extents)
+
+                  parts.append({
+                      "source": mesh_name,
+                      "mesh": p.copy(),
+                      "center": center,
+                      "extents": extents,
+                      "faces": len(p.faces)
+                  })
+
+          print(
+              "Connected parts:",
+              len(parts)
+          )
+
+          # --------------------------------------------------
+          # DOORS / HOOD / TRUNK
+          # --------------------------------------------------
+
+          moving_targets = {
+
+              "Door_FL": {
+                  "center": np.array([
+                      -0.701055,
+                       0.181479,
+                      -0.753107
+                  ]),
+                  "extents": np.array([
+                      0.251228,
+                      1.095754,
+                      0.762524
+                  ])
+              },
+
+              "Door_FR": {
+                  "center": np.array([
+                       0.701055,
+                       0.181479,
+                      -0.753107
+                  ]),
+                  "extents": np.array([
+                      0.251228,
+                      1.095754,
+                      0.762524
+                  ])
+              },
+
+              "Door_RL": {
+                  "center": np.array([
+                      -0.701001,
+                      -0.785976,
+                      -0.753089
+                  ]),
+                  "extents": np.array([
+                      0.251135,
+                      0.997728,
+                      0.762325
+                  ])
+              },
+
+              "Door_RR": {
+                  "center": np.array([
+                       0.701001,
+                      -0.785976,
+                      -0.753089
+                  ]),
+                  "extents": np.array([
+                      0.251135,
+                      0.997728,
+                      0.762325
+                  ])
+              },
+
+              "Hood": {
+                  "center": np.array([
+                       0.000000,
+                       1.307311,
+                      -0.691777
+                  ]),
+                  "extents": np.array([
+                      1.405602,
+                      1.174704,
+                      0.199754
+                  ])
+              },
+
+              "Trunk": {
+                  "center": np.array([
+                       0.000001,
+                      -1.972847,
+                      -0.698122
+                  ]),
+                  "extents": np.array([
+                      1.259136,
+                      0.630947,
+                      0.247513
+                  ])
+              },
+          }
+
+          def score(part, target):
+
+              c = part["center"]
+              e = part["extents"]
+
+              tc = target["center"]
+              te = target["extents"]
+
+              ce = np.linalg.norm(
+                  (c - tc)
+                  / np.maximum(te, 0.1)
+              )
+
+              ee = np.linalg.norm(
+                  (e - te)
+                  / np.maximum(te, 0.1)
+              )
+
+              return ce * 3 + ee
+
+          selected = {}
+          excluded = set()
+
+          for name, target in moving_targets.items():
+
+              ranked = []
+
+              for i, p in enumerate(parts):
+
+                  if i in excluded:
+                      continue
+
+                  ranked.append(
+                      (
+                          score(p, target),
+                          i
+                      )
+                  )
+
+              ranked.sort(
+                  key=lambda x: x[0]
+              )
+
+              best_score, index = ranked[0]
+
+              selected[name] = index
+              excluded.add(index)
+
+              p = parts[index]
+
+              p["mesh"].export(
+                  os.path.join(
+                      OUT,
+                      name + ".ply"
+                  )
+              )
+
+              print()
+              print(name)
+              print(
+                  " score:",
+                  best_score
+              )
+              print(
+                  " source:",
+                  p["source"]
+              )
+              print(
+                  " center:",
+                  np.round(
+                      p["center"],
+                      6
+                  )
+              )
+              print(
+                  " extents:",
+                  np.round(
+                      p["extents"],
+                      6
+                  )
+              )
+              print(
+                  " faces:",
+                  p["faces"]
+              )
+
+          # --------------------------------------------------
+          # CORRECT WHEEL CENTERS
+          # --------------------------------------------------
+
+          wheel_centers = {
+
+              "Wheel_FL": np.array([
+                  -0.824057,
+                   1.321835,
+                  -0.191801
+              ]),
+
+              "Wheel_FR": np.array([
+                   0.824057,
+                   1.321598,
+                  -0.191797
+              ]),
+
+              "Wheel_RL": np.array([
+                  -0.816269,
+                  -1.313133,
+                  -0.169002
+              ]),
+
+              "Wheel_RR": np.array([
+                   0.816269,
+                  -1.313370,
+                  -0.168998
+              ]),
+          }
+
+          wheels = {}
+
+          for wheel_name, wc in wheel_centers.items():
+
+              indices = []
+
+              for i, p in enumerate(parts):
+
+                  # Wheels were identified in Object_22
+                  if p["source"] != "Object_22":
+                      continue
+
+                  c = p["center"]
+
+                  delta = np.abs(
+                      c - wc
+                  )
+
+                  if (
+                      delta[0] < 0.35
+                      and
+                      delta[1] < 0.40
+                      and
+                      delta[2] < 0.40
+                  ):
+                      indices.append(i)
+
+              if not indices:
+
+                  raise RuntimeError(
+                      wheel_name
+                      + " has no components"
+                  )
+
+              meshes = [
+                  parts[i]["mesh"].copy()
+                  for i in indices
+              ]
+
+              wheel = trimesh.util.concatenate(
+                  meshes
+              )
+
+              wheels[wheel_name] = wheel
+
+              excluded.update(indices)
+
+              wheel.export(
+                  os.path.join(
+                      OUT,
+                      wheel_name + ".ply"
+                  )
+              )
+
+              print()
+              print(
+                  "====",
+                  wheel_name,
+                  "===="
+              )
+
+              print(
+                  "pieces:",
+                  len(indices)
+              )
+
+              print(
+                  "faces:",
+                  len(wheel.faces)
+              )
+
+              print(
+                  "center:",
+                  np.round(
+                      wheel.bounds.mean(axis=0),
+                      6
+                  )
+              )
+
+              print(
+                  "extents:",
+                  np.round(
+                      wheel.extents,
+                      6
+                  )
+              )
+
+              # Expected:
+              # pieces ~= 10
+              # faces ~= 1632
+              # extents ~=
+              # 0.22 x 0.56 x 0.57
+
+              if len(indices) < 8:
+
+                  raise RuntimeError(
+                      wheel_name
+                      + " wheel incomplete"
+                  )
+
+              ext = wheel.extents
+
+              if not (
+                  0.18 < ext[0] < 0.30
+                  and
+                  0.50 < ext[1] < 0.62
+                  and
+                  0.50 < ext[2] < 0.62
+              ):
+
+                  raise RuntimeError(
+                      wheel_name
+                      + " dimensions invalid: "
+                      + str(ext)
+                  )
+
+          # --------------------------------------------------
+          # BUILD STATIC BODY
+          # --------------------------------------------------
+
+          body_meshes = []
+
+          for i, p in enumerate(parts):
+
+              if i in excluded:
+                  continue
+
+              body_meshes.append(
+                  p["mesh"].copy()
+              )
+
+          body = trimesh.util.concatenate(
+              body_meshes
+          )
+
+          body.export(
+              os.path.join(
+                  OUT,
+                  "Body_Static.ply"
+              )
+          )
+
+          print()
+          print(
+              "Body faces:",
+              len(body.faces)
+          )
+
+          print(
+              "Body extents:",
+              body.extents
+          )
+
+          # --------------------------------------------------
+          # BUILD NORMALIZED GLB
+          # --------------------------------------------------
+
+          final_scene = trimesh.Scene()
+
+          final_scene.add_geometry(
+              body.copy(),
+              node_name="W201_Body",
+              geom_name="W201_Body"
+          )
+
+          for name, index in selected.items():
+
+              m = parts[index]["mesh"].copy()
+
+              final_scene.add_geometry(
+                  m,
+                  node_name="W201_" + name,
+                  geom_name="W201_" + name
+              )
+
+          for name, wheel in wheels.items():
+
+              final_scene.add_geometry(
+                  wheel.copy(),
+                  node_name="W201_" + name,
+                  geom_name="W201_" + name
+              )
+
+          final_scene.export(
+              os.path.join(
+                  OUT,
+                  "W201_Normalized_V2.glb"
+              )
+          )
+
+          # --------------------------------------------------
+          # WRITE MAP
+          # --------------------------------------------------
+
+          with open(
+              os.path.join(
+                  OUT,
+                  "mapping-v2.txt"
+              ),
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              out.write(
+                  "Mercedes W201 mapping V2\n"
+              )
+
+              out.write(
+                  "=======================\n\n"
+              )
+
+              out.write(
+                  "Coordinates:\n"
+                  "X- = left\n"
+                  "X+ = right\n"
+                  "Y+ = front\n"
+                  "Y- = rear\n\n"
+              )
+
+              for name, index in selected.items():
+
+                  p = parts[index]
+
+                  out.write(
+                      name + "\n"
+                  )
+
+                  out.write(
+                      " source="
+                      + p["source"]
+                      + "\n"
+                  )
+
+                  out.write(
+                      " center="
+                      + str(
+                          np.round(
+                              p["center"],
+                              6
+                          ).tolist()
+                      )
+                      + "\n"
+                  )
+
+                  out.write(
+                      " extents="
+                      + str(
+                          np.round(
+                              p["extents"],
+                              6
+                          ).tolist()
+                      )
+                      + "\n"
+                  )
+
+                  out.write(
+                      " faces="
+                      + str(
+                          p["faces"]
+                      )
+                      + "\n\n"
+                  )
+
+              for name, wheel in wheels.items():
+
+                  out.write(
+                      name + "\n"
+                  )
+
+                  out.write(
+                      " center="
+                      + str(
+                          np.round(
+                              wheel.bounds.mean(
+                                  axis=0
+                              ),
+                              6
+                          ).tolist()
+                      )
+                      + "\n"
+                  )
+
+                  out.write(
+                      " extents="
+                      + str(
+                          np.round(
+                              wheel.extents,
+                              6
+                          ).tolist()
+                      )
+                      + "\n"
+                  )
+
+                  out.write(
+                      " faces="
+                      + str(
+                          len(wheel.faces)
+                      )
+                      + "\n\n"
+                  )
+
+          print()
+          print("W201 V2 EXPORT SUCCESS")
+          PY
+
+      - name: Verify files
+        run: |
+          echo "===== FILES ====="
+          ls -lh work/w201_v2
+
+          echo ""
+          echo "===== MAPPING ====="
+          cat work/w201_v2/mapping-v2.txt
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: W201-Stable-Parts-V2
+          path: |
+            work/w201_v2/
