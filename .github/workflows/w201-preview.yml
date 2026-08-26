@@ -1,0 +1,305 @@
+name: W201 Candidate Preview
+
+on:
+  workflow_dispatch:
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install trimesh==5.0.0 numpy matplotlib pillow networkx
+
+      - name: Render candidate parts
+        run: |
+          mkdir -p work/previews
+
+          python - <<'PY'
+          import os
+          import numpy as np
+          import trimesh
+
+          import matplotlib
+          matplotlib.use("Agg")
+
+          import matplotlib.pyplot as plt
+          from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+          from PIL import Image, ImageDraw
+
+          path = "MercedesW201/Models/1982_mercedes_w201.glb"
+
+          scene = trimesh.load(path, force="scene")
+
+          targets = [
+              ("Object_10", None, "Object_10_FULL"),
+
+              ("Object_10", 252, "DoorCandidate_Xminus_Yplus"),
+              ("Object_10", 324, "DoorCandidate_Xplus_Yplus"),
+              ("Object_10", 139, "DoorCandidate_Xminus_Yminus"),
+              ("Object_10", 141, "DoorCandidate_Xplus_Yminus"),
+
+              ("Object_22", None, "Object_22_Wheels_FULL"),
+
+              ("Object_22", 28, "Wheel_Xminus_Yplus"),
+              ("Object_22", 8,  "Wheel_Xplus_Yplus"),
+              ("Object_22", 38, "Wheel_Xminus_Yminus"),
+              ("Object_22", 18, "Wheel_Xplus_Yminus"),
+
+              ("Object_10", 265, "Panel_10_265"),
+              ("Object_10", 293, "Panel_10_293"),
+              ("Object_10", 350, "Panel_10_350"),
+              ("Object_10", 352, "Panel_10_352"),
+
+              ("Object_11", 0, "Panel_11_0"),
+              ("Object_11", 3, "Panel_11_3"),
+          ]
+
+          def get_part(mesh_name, part_id):
+              mesh = scene.geometry[mesh_name].copy()
+
+              if part_id is None:
+                  return mesh
+
+              pieces = list(
+                  mesh.split(
+                      only_watertight=False
+                  )
+              )
+
+              if part_id >= len(pieces):
+                  raise ValueError(
+                      f"{mesh_name} part {part_id} missing; "
+                      f"only {len(pieces)} parts"
+                  )
+
+              return pieces[part_id]
+
+          def equal_limits(ax, bounds):
+              center = bounds.mean(axis=0)
+              size = bounds[1] - bounds[0]
+
+              radius = max(size) / 2.0
+
+              if radius == 0:
+                  radius = 1
+
+              radius *= 1.15
+
+              ax.set_xlim(
+                  center[0] - radius,
+                  center[0] + radius
+              )
+
+              ax.set_ylim(
+                  center[1] - radius,
+                  center[1] + radius
+              )
+
+              ax.set_zlim(
+                  center[2] - radius,
+                  center[2] + radius
+              )
+
+          def draw_mesh(ax, mesh, title, elev, azim):
+
+              faces = mesh.faces
+
+              if len(faces) > 6000:
+                  step = max(
+                      1,
+                      len(faces) // 6000
+                  )
+                  faces = faces[::step]
+
+              triangles = mesh.vertices[faces]
+
+              poly = Poly3DCollection(
+                  triangles,
+                  linewidths=0.02,
+                  alpha=0.9
+              )
+
+              ax.add_collection3d(poly)
+
+              equal_limits(
+                  ax,
+                  np.asarray(mesh.bounds)
+              )
+
+              ax.view_init(
+                  elev=elev,
+                  azim=azim
+              )
+
+              ax.set_xlabel("X")
+              ax.set_ylabel("Y")
+              ax.set_zlabel("Z")
+
+              ax.set_title(title)
+
+          generated = []
+
+          report = open(
+              "work/selected-parts.txt",
+              "w",
+              encoding="utf-8"
+          )
+
+          for mesh_name, part_id, label in targets:
+
+              try:
+                  mesh = get_part(
+                      mesh_name,
+                      part_id
+                  )
+              except Exception as e:
+                  report.write(
+                      f"{label}: ERROR {e}\n"
+                  )
+                  continue
+
+              report.write(
+                  f"{label}\n"
+                  f"  mesh={mesh_name}\n"
+                  f"  part={part_id}\n"
+                  f"  faces={len(mesh.faces)}\n"
+                  f"  bounds={mesh.bounds.tolist()}\n"
+                  f"  extents={mesh.extents.tolist()}\n\n"
+              )
+
+              fig = plt.figure(
+                  figsize=(15, 5)
+              )
+
+              ax1 = fig.add_subplot(
+                  131,
+                  projection="3d"
+              )
+
+              draw_mesh(
+                  ax1,
+                  mesh,
+                  "Perspective",
+                  20,
+                  -60
+              )
+
+              ax2 = fig.add_subplot(
+                  132,
+                  projection="3d"
+              )
+
+              draw_mesh(
+                  ax2,
+                  mesh,
+                  "Side",
+                  0,
+                  0
+              )
+
+              ax3 = fig.add_subplot(
+                  133,
+                  projection="3d"
+              )
+
+              draw_mesh(
+                  ax3,
+                  mesh,
+                  "Top",
+                  90,
+                  -90
+              )
+
+              fig.suptitle(label)
+              fig.tight_layout()
+
+              out = (
+                  "work/previews/"
+                  + label
+                  + ".png"
+              )
+
+              fig.savefig(
+                  out,
+                  dpi=130
+              )
+
+              plt.close(fig)
+
+              generated.append(
+                  (label, out)
+              )
+
+          report.close()
+
+          thumb_w = 600
+          thumb_h = 230
+          cols = 2
+
+          rows = (
+              len(generated) + cols - 1
+          ) // cols
+
+          sheet = Image.new(
+              "RGB",
+              (
+                  thumb_w * cols,
+                  thumb_h * rows
+              ),
+              "white"
+          )
+
+          draw = ImageDraw.Draw(sheet)
+
+          for i, (label, file) in enumerate(generated):
+
+              img = Image.open(file).convert("RGB")
+
+              img.thumbnail(
+                  (thumb_w - 20, thumb_h - 35)
+              )
+
+              x = (
+                  i % cols
+              ) * thumb_w
+
+              y = (
+                  i // cols
+              ) * thumb_h
+
+              sheet.paste(
+                  img,
+                  (x + 10, y + 25)
+              )
+
+              draw.text(
+                  (x + 10, y + 5),
+                  label,
+                  fill="black"
+              )
+
+          sheet.save(
+              "work/W201-Candidate-Contact-Sheet.jpg",
+              quality=92
+          )
+
+          print(
+              "Rendered:",
+              len(generated)
+          )
+          PY
+
+      - name: Upload preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: W201-Candidate-Preview
+          path: |
+            work/W201-Candidate-Contact-Sheet.jpg
+            work/selected-parts.txt
+            work/previews/
