@@ -1,0 +1,42 @@
+name: LAC Mercedes W201 Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show project files
+        run: |
+          echo "=== Repository ==="
+          find . -maxdepth 4 -type f -print
+
+      - name: Prepare Mercedes model
+        run: |
+          mkdir -p build/MercedesW201/Models
+          mkdir -p build/MercedesW201/Textures
+          mkdir -p build/MercedesW201/Scripts
+
+          if [ -f "MercedesW201/Models/1982_mercedes_w201.glb" ]; then
+            cp "MercedesW201/Models/1982_mercedes_w201.glb" \
+               "build/MercedesW201/Models/1982_mercedes_w201.glb"
+          else
+            echo "Mercedes GLB not found"
+          fi
+
+      - name: Build information
+        run: |
+          echo "Mercedes W201 preparation completed."
+          echo "LAC compiled assets are not modified yet."
+          find build -type f -ls
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mercedes-W201-LAC
+          path: build/
