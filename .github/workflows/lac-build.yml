@@ -20,7 +20,7 @@ jobs:
         run: |
           mkdir -p input
           gh release download v1.0-base \
-            --pattern "lac mode.xapk" \
+            --pattern '*.xapk' \
             --dir input
 
           echo "===== DOWNLOADED ====="
@@ -29,7 +29,7 @@ jobs:
       - name: Extract XAPK
         run: |
           mkdir -p work/xapk
-          unzip -q "input/lac mode.xapk" -d work/xapk
+          unzip -q "input/lac.mode.xapk" -d work/xapk
 
           echo "===== XAPK CONTENT =====" | tee work/xapk-files.txt
           find work/xapk -type f | tee -a work/xapk-files.txt
@@ -104,3 +104,4 @@ jobs:
             work/apk-report.txt
             work/obb-report.txt
             work/vehicle-search.txt
+
