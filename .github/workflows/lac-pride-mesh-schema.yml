@@ -1,0 +1,424 @@
+name: LAC Pride Mesh Schema
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download game
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input work/xapk work/obb
+
+          gh release download v1.0-base \
+            --pattern '*.xapk' \
+            --dir input
+
+          XAPK=$(find input -name "*.xapk" | head -n 1)
+          unzip -q "$XAPK" -d work/xapk
+
+          OBB=$(find work/xapk -name "*.obb" | head -n 1)
+
+          if [ -z "$OBB" ]; then
+            echo "OBB NOT FOUND"
+            exit 1
+          fi
+
+          unzip -q "$OBB" -d work/obb
+
+      - name: Install UnityPy
+        run: |
+          python -m pip install --upgrade pip
+          pip install UnityPy
+
+      - name: Inspect exact Pride meshes
+        run: |
+          python - <<'PY'
+          import UnityPy
+
+          target = "work/obb/assets/bin/Data/data.unity3d"
+          env = UnityPy.load(target)
+
+          objects = list(env.objects)
+
+          TARGET_FILTERS = {
+              11180: "Body",
+              11177: "Door_FL",
+              11183: "Door_FR",
+              11182: "Door_RL",
+              11181: "Door_RR",
+              11188: "Hood",
+              11168: "Trunk",
+          }
+
+          def asset_name(obj):
+              af = getattr(obj, "assets_file", None)
+              return getattr(af, "name", "") or str(af)
+
+          def same_asset(a, b):
+              return (
+                  getattr(a, "assets_file", None)
+                  is getattr(b, "assets_file", None)
+              )
+
+          def pid(ptr):
+              if ptr is None:
+                  return 0
+
+              return (
+                  getattr(ptr, "path_id", 0)
+                  or getattr(ptr, "m_PathID", 0)
+                  or 0
+              )
+
+          def file_id(ptr):
+              if ptr is None:
+                  return 0
+
+              return (
+                  getattr(ptr, "file_id", 0)
+                  or getattr(ptr, "m_FileID", 0)
+                  or 0
+              )
+
+          def find_same_file(source_obj, path_id):
+
+              for candidate in objects:
+
+                  if (
+                      candidate.path_id == path_id
+                      and same_asset(source_obj, candidate)
+                  ):
+                      return candidate
+
+              return None
+
+          report = open(
+              "work/pride-mesh-schema.txt",
+              "w",
+              encoding="utf-8"
+          )
+
+          report.write(
+              "LAC VEHICLE_PRIDE MESH SCHEMA\n"
+              "=============================\n\n"
+          )
+
+          found = {}
+
+          for obj in objects:
+
+              if obj.path_id not in TARGET_FILTERS:
+                  continue
+
+              if obj.type.name != "MeshFilter":
+                  continue
+
+              logical_name = TARGET_FILTERS[obj.path_id]
+
+              try:
+                  data = obj.read()
+              except Exception as e:
+                  report.write(
+                      f"{logical_name}: MeshFilter READ ERROR {e}\n\n"
+                  )
+                  continue
+
+              mesh_ptr = getattr(
+                  data,
+                  "m_Mesh",
+                  None
+              )
+
+              mesh_pid = pid(mesh_ptr)
+              mesh_file_id = file_id(mesh_ptr)
+
+              mesh_obj = find_same_file(
+                  obj,
+                  mesh_pid
+              )
+
+              report.write(
+                  "=" * 80 + "\n"
+              )
+
+              report.write(
+                  f"TARGET: {logical_name}\n"
+              )
+
+              report.write(
+                  f"MeshFilter PathID: {obj.path_id}\n"
+              )
+
+              report.write(
+                  f"Mesh pointer FileID: {mesh_file_id}\n"
+              )
+
+              report.write(
+                  f"Mesh pointer PathID: {mesh_pid}\n"
+              )
+
+              report.write(
+                  f"Asset file: {asset_name(obj)}\n"
+              )
+
+              af = getattr(
+                  obj,
+                  "assets_file",
+                  None
+              )
+
+              for attr in (
+                  "unity_version",
+                  "version",
+                  "format_version",
+                  "platform"
+              ):
+
+                  try:
+                      value = getattr(
+                          af,
+                          attr
+                      )
+
+                      report.write(
+                          f"assets_file.{attr}: {value}\n"
+                      )
+                  except Exception:
+                      pass
+
+              if mesh_obj is None:
+
+                  report.write(
+                      "MESH OBJECT NOT RESOLVED\n\n"
+                  )
+
+                  continue
+
+              found[logical_name] = mesh_pid
+
+              report.write(
+                  f"Mesh reader type: {mesh_obj.type.name}\n"
+              )
+
+              try:
+                  mesh = mesh_obj.read()
+              except Exception as e:
+
+                  report.write(
+                      f"Mesh READ ERROR: {e}\n\n"
+                  )
+
+                  continue
+
+              report.write(
+                  f"Mesh Name: "
+                  f"{getattr(mesh, 'm_Name', '')}\n"
+              )
+
+              for field in (
+                  "m_MeshCompression",
+                  "m_IsReadable",
+                  "m_KeepVertices",
+                  "m_KeepIndices"
+              ):
+
+                  if hasattr(mesh, field):
+
+                      report.write(
+                          f"{field}: "
+                          f"{getattr(mesh, field)}\n"
+                      )
+
+              try:
+                  report.write(
+                      f"VertexCount: "
+                      f"{mesh.m_VertexData.m_VertexCount}\n"
+                  )
+              except Exception:
+                  pass
+
+              try:
+                  report.write(
+                      f"IndexBuffer bytes: "
+                      f"{len(mesh.m_IndexBuffer)}\n"
+                  )
+              except Exception:
+                  pass
+
+              try:
+                  report.write(
+                      f"SubMesh count: "
+                      f"{len(mesh.m_SubMeshes)}\n"
+                  )
+
+                  for i, sm in enumerate(mesh.m_SubMeshes):
+
+                      report.write(
+                          f"  SUBMESH {i}\n"
+                      )
+
+                      for field in (
+                          "firstByte",
+                          "indexCount",
+                          "topology",
+                          "baseVertex",
+                          "firstVertex",
+                          "vertexCount"
+                      ):
+
+                          if hasattr(sm, field):
+
+                              report.write(
+                                  f"    {field}="
+                                  f"{getattr(sm, field)}\n"
+                              )
+
+              except Exception as e:
+
+                  report.write(
+                      f"SubMesh inspect error: {e}\n"
+                  )
+
+              try:
+
+                  vd = mesh.m_VertexData
+
+                  channels = getattr(
+                      vd,
+                      "m_Channels",
+                      []
+                  )
+
+                  report.write(
+                      f"Vertex channels: "
+                      f"{len(channels)}\n"
+                  )
+
+                  for i, ch in enumerate(channels):
+
+                      vals = []
+
+                      for field in (
+                          "stream",
+                          "offset",
+                          "format",
+                          "dimension"
+                      ):
+
+                          if hasattr(ch, field):
+
+                              vals.append(
+                                  f"{field}="
+                                  f"{getattr(ch, field)}"
+                              )
+
+                      report.write(
+                          f"  CHANNEL {i}: "
+                          + ", ".join(vals)
+                          + "\n"
+                      )
+
+                  data_blob = getattr(
+                      vd,
+                      "m_DataSize",
+                      b""
+                  )
+
+                  try:
+                      report.write(
+                          f"Vertex DataSize bytes: "
+                          f"{len(data_blob)}\n"
+                      )
+                  except Exception:
+                      report.write(
+                          f"Vertex DataSize: {data_blob}\n"
+                      )
+
+              except Exception as e:
+
+                  report.write(
+                      f"VertexData inspect error: {e}\n"
+                  )
+
+              try:
+
+                  stream = mesh.m_StreamData
+
+                  report.write(
+                      f"Stream path: {stream.path}\n"
+                  )
+
+                  report.write(
+                      f"Stream offset: {stream.offset}\n"
+                  )
+
+                  report.write(
+                      f"Stream size: {stream.size}\n"
+                  )
+
+              except Exception as e:
+
+                  report.write(
+                      f"StreamData: unavailable ({e})\n"
+                  )
+
+              try:
+
+                  tree = mesh_obj.read_typetree()
+
+                  report.write(
+                      "Typetree root keys:\n"
+                  )
+
+                  for key in tree.keys():
+                      report.write(
+                          f"  {key}\n"
+                      )
+
+              except Exception as e:
+
+                  report.write(
+                      f"Typetree unavailable: {e}\n"
+                  )
+
+              report.write("\n")
+
+          report.write(
+              "\nFINAL TARGET MAP\n"
+              "================\n"
+          )
+
+          for mf, name in TARGET_FILTERS.items():
+
+              report.write(
+                  f"{name}: "
+                  f"MeshFilter={mf}, "
+                  f"Mesh={found.get(name, 'NOT_FOUND')}\n"
+              )
+
+          report.close()
+
+          print(
+              open(
+                  "work/pride-mesh-schema.txt",
+                  encoding="utf-8"
+              ).read()
+          )
+          PY
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAC-Pride-Mesh-Schema
+          path: work/pride-mesh-schema.txt
