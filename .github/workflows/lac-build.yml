@@ -1,42 +1,106 @@
-name: LAC Mercedes W201 Build
+name: LAC XAPK Inspector
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  inspect:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show project files
+      - name: Download LAC XAPK
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "=== Repository ==="
-          find . -maxdepth 4 -type f -print
+          mkdir -p input
+          gh release download v1.0-base \
+            --pattern "lac mode.xapk" \
+            --dir input
 
-      - name: Prepare Mercedes model
+          echo "===== DOWNLOADED ====="
+          ls -lh input
+
+      - name: Extract XAPK
         run: |
-          mkdir -p build/MercedesW201/Models
-          mkdir -p build/MercedesW201/Textures
-          mkdir -p build/MercedesW201/Scripts
+          mkdir -p work/xapk
+          unzip -q "input/lac mode.xapk" -d work/xapk
 
-          if [ -f "MercedesW201/Models/1982_mercedes_w201.glb" ]; then
-            cp "MercedesW201/Models/1982_mercedes_w201.glb" \
-               "build/MercedesW201/Models/1982_mercedes_w201.glb"
-          else
-            echo "Mercedes GLB not found"
+          echo "===== XAPK CONTENT =====" | tee work/xapk-files.txt
+          find work/xapk -type f | tee -a work/xapk-files.txt
+
+      - name: Inspect APK
+        run: |
+          APK=$(find work/xapk -type f -name "*.apk" | head -n 1)
+
+          echo "APK=$APK" | tee work/apk-report.txt
+
+          if [ -n "$APK" ]; then
+            echo "" >> work/apk-report.txt
+            echo "===== APK FILE LIST =====" >> work/apk-report.txt
+            unzip -l "$APK" >> work/apk-report.txt
+
+            echo "" >> work/apk-report.txt
+            echo "===== UNITY / IL2CPP =====" >> work/apk-report.txt
+            unzip -l "$APK" | grep -Ei \
+              "unity|il2cpp|global-metadata|assets|vehicle|car|animation|animator" \
+              >> work/apk-report.txt || true
           fi
 
-      - name: Build information
+      - name: Find OBB
         run: |
-          echo "Mercedes W201 preparation completed."
-          echo "LAC compiled assets are not modified yet."
-          find build -type f -ls
+          OBB=$(find work/xapk -type f -name "*.obb" | head -n 1)
 
-      - name: Upload artifact
+          echo "OBB=$OBB" | tee work/obb-report.txt
+
+          if [ -z "$OBB" ]; then
+            echo "OBB NOT FOUND"
+            exit 1
+          fi
+
+          file "$OBB" | tee -a work/obb-report.txt
+          ls -lh "$OBB" | tee -a work/obb-report.txt
+
+      - name: Extract OBB
+        run: |
+          OBB=$(find work/xapk -type f -name "*.obb" | head -n 1)
+
+          mkdir -p work/obb
+
+          echo "===== OBB FILE LIST =====" >> work/obb-report.txt
+          unzip -l "$OBB" | tee -a work/obb-report.txt
+
+          unzip -q "$OBB" -d work/obb
+
+      - name: Search Unity vehicle files
+        run: |
+          echo "===== POSSIBLE VEHICLE / UNITY FILES =====" \
+            | tee work/vehicle-search.txt
+
+          find work/obb -type f | grep -Ei \
+            "car|vehicle|wheel|drive|motor|engine|animation|animator|controller|prefab|sharedassets|resources|globalgamemanagers|level|data" \
+            | tee -a work/vehicle-search.txt || true
+
+          echo "" >> work/vehicle-search.txt
+          echo "===== ALL EXTRACTED FILES =====" >> work/vehicle-search.txt
+          find work/obb -type f >> work/vehicle-search.txt
+
+      - name: Show Mercedes model
+        run: |
+          echo "===== MERCEDES MODEL ====="
+          ls -lh MercedesW201/Models/1982_mercedes_w201.glb
+
+      - name: Upload inspection reports
         uses: actions/upload-artifact@v4
         with:
-          name: Mercedes-W201-LAC
-          path: build/
+          name: LAC-XAPK-Inspection
+          path: |
+            work/xapk-files.txt
+            work/apk-report.txt
+            work/obb-report.txt
+            work/vehicle-search.txt
