@@ -1,0 +1,219 @@
+name: Mercedes W201 Parts Scan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install trimesh numpy pandas scipy networkx
+
+      - name: Analyze W201 parts
+        run: |
+          mkdir -p work/w201_parts
+
+          python - <<'PY'
+          import os
+          import numpy as np
+          import pandas as pd
+          import trimesh
+
+          path = "MercedesW201/Models/1982_mercedes_w201.glb"
+
+          scene = trimesh.load(path, force="scene")
+
+          rows = []
+          candidates = []
+
+          for mesh_name, mesh in scene.geometry.items():
+
+              try:
+                  pieces = mesh.split(
+                      only_watertight=False
+                  )
+              except Exception:
+                  pieces = [mesh]
+
+              if not pieces:
+                  pieces = [mesh]
+
+              for i, part in enumerate(pieces):
+
+                  if len(part.faces) < 20:
+                      continue
+
+                  bounds = np.asarray(part.bounds)
+                  ext = np.asarray(part.extents)
+                  center = bounds.mean(axis=0)
+
+                  row = {
+                      "mesh": mesh_name,
+                      "part": i,
+                      "vertices": len(part.vertices),
+                      "faces": len(part.faces),
+
+                      "center_x": center[0],
+                      "center_y": center[1],
+                      "center_z": center[2],
+
+                      "size_x": ext[0],
+                      "size_y": ext[1],
+                      "size_z": ext[2],
+
+                      "min_x": bounds[0][0],
+                      "min_y": bounds[0][1],
+                      "min_z": bounds[0][2],
+
+                      "max_x": bounds[1][0],
+                      "max_y": bounds[1][1],
+                      "max_z": bounds[1][2],
+                  }
+
+                  rows.append(row)
+
+                  sx, sy, sz = ext
+                  cx, cy, cz = center
+
+                  # W201 source coordinates:
+                  # X = left/right
+                  # Y = front/rear
+                  # Z = height
+
+                  tags = []
+
+                  # Compact objects near outer left/right edges
+                  # are possible wheels.
+                  if (
+                      abs(cx) > 0.55
+                      and sx < 0.8
+                      and sy < 1.0
+                      and sz < 1.0
+                  ):
+                      tags.append("WHEEL_CANDIDATE")
+
+                  # Thin large side panels = possible doors.
+                  if (
+                      abs(cx) > 0.55
+                      and sx < 0.35
+                      and 0.45 < sy < 1.7
+                      and 0.35 < sz < 1.2
+                  ):
+                      tags.append("DOOR_CANDIDATE")
+
+                  # Wide horizontal panels near front/back.
+                  if (
+                      sx > 0.9
+                      and sy < 1.5
+                      and sz < 0.5
+                  ):
+                      tags.append("HOOD_TRUNK_CANDIDATE")
+
+                  if tags:
+                      candidates.append({
+                          **row,
+                          "tags": ",".join(tags)
+                      })
+
+                  safe_name = (
+                      mesh_name
+                      .replace("/", "_")
+                      .replace("\\", "_")
+                  )
+
+                  out_path = (
+                      f"work/w201_parts/"
+                      f"{safe_name}_part_{i:03d}.ply"
+                  )
+
+                  try:
+                      part.export(out_path)
+                  except Exception:
+                      pass
+
+          df = pd.DataFrame(rows)
+
+          df.to_csv(
+              "work/w201-parts.csv",
+              index=False
+          )
+
+          cdf = pd.DataFrame(candidates)
+
+          cdf.to_csv(
+              "work/w201-candidates.csv",
+              index=False
+          )
+
+          with open(
+              "work/w201-parts-summary.txt",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              out.write(
+                  f"Original geometries: "
+                  f"{len(scene.geometry)}\n"
+              )
+
+              out.write(
+                  f"Connected parts: "
+                  f"{len(df)}\n\n"
+              )
+
+              if len(cdf):
+
+                  for _, r in cdf.iterrows():
+
+                      out.write(
+                          f"{r['tags']}\n"
+                          f"  mesh={r['mesh']} "
+                          f"part={r['part']}\n"
+                          f"  center=("
+                          f"{r['center_x']:.4f}, "
+                          f"{r['center_y']:.4f}, "
+                          f"{r['center_z']:.4f})\n"
+                          f"  size=("
+                          f"{r['size_x']:.4f}, "
+                          f"{r['size_y']:.4f}, "
+                          f"{r['size_z']:.4f})\n"
+                          f"  faces={r['faces']}\n\n"
+                      )
+
+          print("Original meshes:", len(scene.geometry))
+          print("Connected parts:", len(df))
+          print("Candidates:", len(cdf))
+
+          if len(cdf):
+              print(cdf[
+                  [
+                      "tags",
+                      "mesh",
+                      "part",
+                      "center_x",
+                      "center_y",
+                      "center_z",
+                      "size_x",
+                      "size_y",
+                      "size_z",
+                      "faces"
+                  ]
+              ].to_string(index=False))
+
+          PY
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mercedes-W201-Parts-Scan
+          path: |
+            work/w201-parts.csv
+            work/w201-candidates.csv
+            work/w201-parts-summary.txt
