@@ -1,0 +1,385 @@
+name: W201 Stable Parts Export
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install trimesh numpy scipy networkx
+
+      - name: Export stable W201 parts
+        run: |
+          mkdir -p work/w201_export
+
+          python - <<'PY'
+          import os
+          import math
+          import numpy as np
+          import trimesh
+
+          source = "MercedesW201/Models/1982_mercedes_w201.glb"
+          outdir = "work/w201_export"
+
+          scene = trimesh.load(source, force="scene")
+
+          parts = []
+
+          for mesh_name, mesh in scene.geometry.items():
+              try:
+                  pieces = list(
+                      mesh.split(
+                          only_watertight=False
+                      )
+                  )
+              except Exception:
+                  pieces = [mesh]
+
+              for part in pieces:
+
+                  if len(part.faces) < 20:
+                      continue
+
+                  bounds = np.asarray(part.bounds)
+                  extents = np.asarray(part.extents)
+                  center = bounds.mean(axis=0)
+
+                  parts.append({
+                      "mesh_name": mesh_name,
+                      "mesh": part.copy(),
+                      "center": center,
+                      "extents": extents,
+                      "faces": len(part.faces)
+                  })
+
+          print("Connected components:", len(parts))
+
+          # Targets from previous geometry scan.
+          targets = {
+              "Door_FL": {
+                  "center": np.array([-0.701,  0.181, -0.20]),
+                  "extents": np.array([0.251, 1.096, 0.763]),
+              },
+
+              "Door_FR": {
+                  "center": np.array([ 0.701,  0.181, -0.20]),
+                  "extents": np.array([0.251, 1.096, 0.763]),
+              },
+
+              "Door_RL": {
+                  "center": np.array([-0.701, -0.786, -0.20]),
+                  "extents": np.array([0.251, 0.998, 0.762]),
+              },
+
+              "Door_RR": {
+                  "center": np.array([ 0.701, -0.786, -0.20]),
+                  "extents": np.array([0.251, 0.998, 0.762]),
+              },
+
+              "Hood": {
+                  "center": np.array([0.000,  1.307, -0.692]),
+                  "extents": np.array([1.406, 1.175, 0.200]),
+              },
+
+              "Trunk": {
+                  "center": np.array([0.000, -1.973, -0.698]),
+                  "extents": np.array([1.259, 0.631, 0.248]),
+              },
+
+              "Wheel_FL": {
+                  "center": np.array([-0.82,  1.32, -0.94]),
+                  "extents": np.array([0.25, 0.55, 0.55]),
+              },
+
+              "Wheel_FR": {
+                  "center": np.array([ 0.82,  1.32, -0.94]),
+                  "extents": np.array([0.25, 0.55, 0.55]),
+              },
+
+              "Wheel_RL": {
+                  "center": np.array([-0.82, -1.31, -0.94]),
+                  "extents": np.array([0.25, 0.55, 0.55]),
+              },
+
+              "Wheel_RR": {
+                  "center": np.array([ 0.82, -1.31, -0.94]),
+                  "extents": np.array([0.25, 0.55, 0.55]),
+              },
+          }
+
+          def score(part, target):
+
+              c = part["center"]
+              e = part["extents"]
+
+              tc = target["center"]
+              te = target["extents"]
+
+              center_error = np.linalg.norm(
+                  (c - tc) / np.maximum(te, 0.15)
+              )
+
+              extent_error = np.linalg.norm(
+                  (e - te) / np.maximum(te, 0.15)
+              )
+
+              return (
+                  center_error * 2.0
+                  + extent_error
+              )
+
+          selected = {}
+          used = set()
+
+          for target_name, target in targets.items():
+
+              ranked = []
+
+              for index, part in enumerate(parts):
+
+                  if index in used:
+                      continue
+
+                  s = score(part, target)
+
+                  ranked.append(
+                      (s, index)
+                  )
+
+              ranked.sort(
+                  key=lambda x: x[0]
+              )
+
+              best_score, best_index = ranked[0]
+
+              selected[target_name] = best_index
+              used.add(best_index)
+
+              p = parts[best_index]
+
+              export_path = os.path.join(
+                  outdir,
+                  target_name + ".ply"
+              )
+
+              p["mesh"].export(export_path)
+
+              print(
+                  target_name,
+                  "score=",
+                  round(best_score, 4),
+                  "mesh=",
+                  p["mesh_name"],
+                  "center=",
+                  np.round(p["center"], 4),
+                  "extents=",
+                  np.round(p["extents"], 4),
+                  "faces=",
+                  p["faces"]
+              )
+
+          # Collect wheel assemblies:
+          # all small nearby parts around each wheel center.
+          wheel_centers = {
+              "WheelAssembly_FL": np.array([-0.82,  1.32, -0.94]),
+              "WheelAssembly_FR": np.array([ 0.82,  1.32, -0.94]),
+              "WheelAssembly_RL": np.array([-0.82, -1.31, -0.94]),
+              "WheelAssembly_RR": np.array([ 0.82, -1.31, -0.94]),
+          }
+
+          wheel_used = set()
+
+          for name, wc in wheel_centers.items():
+
+              assembly = []
+
+              for index, p in enumerate(parts):
+
+                  c = p["center"]
+                  e = p["extents"]
+
+                  delta = np.abs(c - wc)
+
+                  if (
+                      delta[0] < 0.35
+                      and delta[1] < 0.45
+                      and delta[2] < 0.45
+                      and max(e) < 0.9
+                  ):
+                      assembly.append(
+                          p["mesh"].copy()
+                      )
+
+                      wheel_used.add(index)
+
+              if assembly:
+
+                  merged = trimesh.util.concatenate(
+                      assembly
+                  )
+
+                  merged.export(
+                      os.path.join(
+                          outdir,
+                          name + ".ply"
+                      )
+                  )
+
+                  print(
+                      name,
+                      "pieces=",
+                      len(assembly),
+                      "faces=",
+                      len(merged.faces)
+                  )
+
+          # Create static body:
+          # everything except selected moving panels
+          # and wheel assemblies.
+          excluded = set(selected.values()) | wheel_used
+
+          body_parts = []
+
+          for index, p in enumerate(parts):
+
+              if index in excluded:
+                  continue
+
+              body_parts.append(
+                  p["mesh"].copy()
+              )
+
+          body = trimesh.util.concatenate(
+              body_parts
+          )
+
+          body.export(
+              os.path.join(
+                  outdir,
+                  "Body_Static.ply"
+              )
+          )
+
+          print(
+              "Body_Static pieces:",
+              len(body_parts)
+          )
+
+          print(
+              "Body_Static faces:",
+              len(body.faces)
+          )
+
+          with open(
+              os.path.join(
+                  outdir,
+                  "mapping.txt"
+              ),
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              out.write(
+                  "Mercedes W201 stable mapping\n"
+              )
+
+              out.write(
+                  "============================\n\n"
+              )
+
+              out.write(
+                  "Coordinate convention:\n"
+                  "X- = left\n"
+                  "X+ = right\n"
+                  "Y+ = front\n"
+                  "Y- = rear\n\n"
+              )
+
+              for name, index in selected.items():
+
+                  p = parts[index]
+
+                  out.write(
+                      f"{name}\n"
+                  )
+
+                  out.write(
+                      f"  source_mesh={p['mesh_name']}\n"
+                  )
+
+                  out.write(
+                      "  center="
+                      + str(
+                          np.round(
+                              p["center"],
+                              6
+                          ).tolist()
+                      )
+                      + "\n"
+                  )
+
+                  out.write(
+                      "  extents="
+                      + str(
+                          np.round(
+                              p["extents"],
+                              6
+                          ).tolist()
+                      )
+                      + "\n"
+                  )
+
+                  out.write(
+                      f"  faces={p['faces']}\n\n"
+                  )
+
+          # Export a combined named GLB for inspection.
+          new_scene = trimesh.Scene()
+
+          body_copy = body.copy()
+
+          new_scene.add_geometry(
+              body_copy,
+              node_name="W201_Body",
+              geom_name="W201_Body"
+          )
+
+          for name, index in selected.items():
+
+              mesh = parts[index]["mesh"].copy()
+
+              new_scene.add_geometry(
+                  mesh,
+                  node_name="W201_" + name,
+                  geom_name="W201_" + name
+              )
+
+          new_scene.export(
+              os.path.join(
+                  outdir,
+                  "W201_Normalized.glb"
+              )
+          )
+
+          print("Export complete")
+          PY
+
+      - name: List outputs
+        run: |
+          ls -lh work/w201_export
+          cat work/w201_export/mapping.txt
+
+      - name: Upload stable parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: W201-Stable-Parts
+          path: |
+            work/w201_export/
