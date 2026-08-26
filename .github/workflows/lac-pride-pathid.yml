@@ -1,0 +1,445 @@
+name: LAC Pride PathID Scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download and extract game
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p input work/xapk work/obb
+          gh release download v1.0-base --pattern '*.xapk' --dir input
+
+          XAPK=$(find input -name "*.xapk" | head -n 1)
+          unzip -q "$XAPK" -d work/xapk
+
+          OBB=$(find work/xapk -name "*.obb" | head -n 1)
+
+          if [ -z "$OBB" ]; then
+            echo "OBB NOT FOUND"
+            exit 1
+          fi
+
+          unzip -q "$OBB" -d work/obb
+
+      - name: Install UnityPy
+        run: |
+          pip install UnityPy
+
+      - name: Scan Pride using PathID
+        run: |
+          python - <<'PY'
+          import UnityPy
+          from collections import defaultdict
+
+          path = "work/obb/assets/bin/Data/data.unity3d"
+          env = UnityPy.load(path)
+
+          objects = list(env.objects)
+          by_pid = {o.path_id: o for o in objects}
+
+          cache = {}
+
+          def read(obj):
+              if obj.path_id in cache:
+                  return cache[obj.path_id]
+              try:
+                  d = obj.read()
+              except Exception:
+                  d = None
+              cache[obj.path_id] = d
+              return d
+
+          def pid(ptr):
+              if ptr is None:
+                  return 0
+              return (
+                  getattr(ptr, "path_id", 0)
+                  or getattr(ptr, "m_PathID", 0)
+                  or 0
+              )
+
+          def ptr_name(ptr):
+              p = pid(ptr)
+              obj = by_pid.get(p)
+              if not obj:
+                  return f"<PathID:{p}>"
+              d = read(obj)
+              if d is None:
+                  return f"<PathID:{p}>"
+              return getattr(d, "m_Name", "") or f"<PathID:{p}>"
+
+          gameobjects = {}
+          components = defaultdict(list)
+
+          transform_to_go = {}
+          go_to_transform = {}
+
+          for obj in objects:
+              typ = obj.type.name
+              d = read(obj)
+
+              if d is None:
+                  continue
+
+              if typ == "GameObject":
+                  goid = obj.path_id
+                  gameobjects[goid] = getattr(d, "m_Name", "") or ""
+
+                  raw = (
+                      getattr(d, "m_Component", None)
+                      or getattr(d, "m_Components", None)
+                      or []
+                  )
+
+                  for entry in raw:
+                      ptr = (
+                          getattr(entry, "component", None)
+                          or getattr(entry, "m_Component", None)
+                          or entry
+                      )
+
+                      cpid = pid(ptr)
+
+                      if cpid:
+                          components[goid].append(cpid)
+
+              elif typ in ("Transform", "RectTransform"):
+                  goid = pid(getattr(d, "m_GameObject", None))
+
+                  if goid:
+                      transform_to_go[obj.path_id] = goid
+                      go_to_transform[goid] = obj.path_id
+
+          parent = {}
+          children = defaultdict(list)
+
+          for tpid, goid in transform_to_go.items():
+              t_obj = by_pid.get(tpid)
+
+              if not t_obj:
+                  continue
+
+              td = read(t_obj)
+
+              father_tpid = pid(
+                  getattr(td, "m_Father", None)
+              )
+
+              parent_go = transform_to_go.get(father_tpid)
+
+              if parent_go:
+                  parent[goid] = parent_go
+                  children[parent_go].append(goid)
+
+          def name(goid):
+              return gameobjects.get(goid, f"<GO:{goid}>")
+
+          def full_path(goid):
+              out = []
+              seen = set()
+
+              while goid and goid not in seen:
+                  seen.add(goid)
+                  out.append(name(goid))
+                  goid = parent.get(goid)
+
+              return "/".join(reversed(out))
+
+          roots = [
+              goid
+              for goid, n in gameobjects.items()
+              if n.lower().startswith("vehicle_pride")
+          ]
+
+          pride = set()
+
+          def collect(goid):
+              if goid in pride:
+                  return
+
+              pride.add(goid)
+
+              for child in children.get(goid, []):
+                  collect(child)
+
+          for root in roots:
+              collect(root)
+
+          def script_name(cobj):
+              d = read(cobj)
+
+              if d is None:
+                  return ""
+
+              sptr = getattr(d, "m_Script", None)
+              spid = pid(sptr)
+
+              sobj = by_pid.get(spid)
+
+              if not sobj:
+                  return f"MonoScript PathID={spid}"
+
+              sd = read(sobj)
+
+              if sd is None:
+                  return f"MonoScript PathID={spid}"
+
+              cls = getattr(sd, "m_ClassName", "") or ""
+              ns = getattr(sd, "m_Namespace", "") or ""
+              asm = getattr(sd, "m_AssemblyName", "") or ""
+
+              return f"{ns}.{cls} [{asm}]"
+
+          def details(cobj):
+              typ = cobj.type.name
+              d = read(cobj)
+
+              if d is None:
+                  return "READ_ERROR"
+
+              vals = []
+
+              if typ == "MonoBehaviour":
+                  vals.append("script=" + script_name(cobj))
+
+              elif typ == "MeshFilter":
+                  vals.append(
+                      "mesh=" +
+                      ptr_name(getattr(d, "m_Mesh", None))
+                  )
+
+              elif typ == "SkinnedMeshRenderer":
+                  vals.append(
+                      "mesh=" +
+                      ptr_name(getattr(d, "m_Mesh", None))
+                  )
+
+              elif typ in (
+                  "MeshRenderer",
+                  "SkinnedMeshRenderer"
+              ):
+                  try:
+                      mats = [
+                          ptr_name(x)
+                          for x in d.m_Materials
+                      ]
+                      vals.append(
+                          "materials=" + ",".join(mats)
+                      )
+                  except Exception:
+                      pass
+
+              elif typ == "Rigidbody":
+                  for f in (
+                      "m_Mass",
+                      "m_Drag",
+                      "m_AngularDrag",
+                      "m_UseGravity",
+                      "m_IsKinematic"
+                  ):
+                      if hasattr(d, f):
+                          vals.append(
+                              f"{f}={getattr(d, f)}"
+                          )
+
+              elif typ == "WheelCollider":
+                  for f in (
+                      "m_Mass",
+                      "m_Radius",
+                      "m_SuspensionDistance",
+                      "m_ForceAppPointDistance"
+                  ):
+                      if hasattr(d, f):
+                          vals.append(
+                              f"{f}={getattr(d, f)}"
+                          )
+
+              elif "Collider" in typ:
+                  if hasattr(d, "m_IsTrigger"):
+                      vals.append(
+                          f"trigger={d.m_IsTrigger}"
+                      )
+
+              return "; ".join(vals)
+
+          with open(
+              "work/pride-pathid-components.tsv",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              out.write(
+                  "GameObject\tGO_PathID\tPath\t"
+                  "Component\tComponent_PathID\tDetails\n"
+              )
+
+              for goid in sorted(
+                  pride,
+                  key=lambda x: full_path(x).lower()
+              ):
+                  for cpid in components.get(goid, []):
+                      cobj = by_pid.get(cpid)
+
+                      if cobj:
+                          ctype = cobj.type.name
+                          det = details(cobj)
+                      else:
+                          ctype = "UNRESOLVED"
+                          det = ""
+
+                      det = det.replace("\t", " ")
+
+                      out.write(
+                          f"{name(goid)}\t"
+                          f"{goid}\t"
+                          f"{full_path(goid)}\t"
+                          f"{ctype}\t"
+                          f"{cpid}\t"
+                          f"{det}\n"
+                      )
+
+          with open(
+              "work/pride-pathid-hierarchy.txt",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              def dump(goid, depth=0):
+                  ind = "  " * depth
+
+                  out.write(
+                      f"{ind}- {name(goid)} "
+                      f"[GO PathID={goid}]\n"
+                  )
+
+                  for cpid in components.get(goid, []):
+                      cobj = by_pid.get(cpid)
+
+                      if cobj:
+                          out.write(
+                              f"{ind}    "
+                              f"[{cobj.type.name}] "
+                              f"PathID={cpid} "
+                              f"{details(cobj)}\n"
+                          )
+                      else:
+                          out.write(
+                              f"{ind}    "
+                              f"[UNRESOLVED] "
+                              f"PathID={cpid}\n"
+                          )
+
+                  for child in sorted(
+                      children.get(goid, []),
+                      key=lambda x: name(x).lower()
+                  ):
+                      dump(child, depth + 1)
+
+              for root in roots:
+                  out.write(
+                      f"ROOT: {full_path(root)}\n\n"
+                  )
+                  dump(root)
+                  out.write("\n")
+
+          with open(
+              "work/pride-mesh-map.txt",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              for goid in sorted(
+                  pride,
+                  key=lambda x: full_path(x).lower()
+              ):
+                  for cpid in components.get(goid, []):
+                      cobj = by_pid.get(cpid)
+
+                      if not cobj:
+                          continue
+
+                      if cobj.type.name in (
+                          "MeshFilter",
+                          "MeshRenderer",
+                          "SkinnedMeshRenderer"
+                      ):
+                          out.write(
+                              f"{full_path(goid)}\n"
+                          )
+                          out.write(
+                              f"  {cobj.type.name} "
+                              f"PathID={cpid}\n"
+                          )
+                          out.write(
+                              f"  {details(cobj)}\n\n"
+                          )
+
+          with open(
+              "work/pride-script-map.txt",
+              "w",
+              encoding="utf-8"
+          ) as out:
+
+              for goid in sorted(
+                  pride,
+                  key=lambda x: full_path(x).lower()
+              ):
+                  for cpid in components.get(goid, []):
+                      cobj = by_pid.get(cpid)
+
+                      if (
+                          cobj and
+                          cobj.type.name == "MonoBehaviour"
+                      ):
+                          out.write(
+                              f"{full_path(goid)}\n"
+                          )
+                          out.write(
+                              f"  Component PathID={cpid}\n"
+                          )
+                          out.write(
+                              f"  {script_name(cobj)}\n\n"
+                          )
+
+          print("Vehicle_Pride roots:", len(roots))
+          print("Vehicle_Pride GameObjects:", len(pride))
+          print(
+              "Component references:",
+              sum(
+                  len(components[x])
+                  for x in pride
+              )
+          )
+          PY
+
+      - name: Build important report
+        run: |
+          grep -Ei \
+          'wheel|door|seat|body|hood|trunk|steer|engine|rigidbody|collider|mesh' \
+          work/pride-pathid-components.tsv \
+          > work/pride-important.txt || true
+
+          head -n 300 work/pride-important.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: LAC-Pride-PathID-Scan
+          path: |
+            work/pride-pathid-hierarchy.txt
+            work/pride-pathid-components.tsv
+            work/pride-mesh-map.txt
+            work/pride-script-map.txt
+            work/pride-important.txt
